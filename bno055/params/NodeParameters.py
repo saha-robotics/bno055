@@ -101,6 +101,12 @@ class NodeParameters:
         node.declare_parameter('variance_orientation', value=registers.DEFAULT_VARIANCE_ORIENTATION)
         node.declare_parameter('variance_mag', value=registers.DEFAULT_VARIANCE_MAG)
 
+        # IMU anomaly detection parameters
+        node.declare_parameter('imu_change_epsilon', value=0.0001)
+        node.declare_parameter('imu_constant_threshold', value=100)
+        node.declare_parameter('imu_history_size', value=20)
+        node.declare_parameter('max_std_dev_threshold', value=1.5)
+
         # get the parameters - requires CLI arguments '--ros-args --params-file <parameter file>'
         node.get_logger().info('Parameters set to:')
 
@@ -186,6 +192,15 @@ class NodeParameters:
             node.get_logger().info('\tvariance_orientation:\t"%s"' % self.variance_orientation.value)
             self.variance_mag = node.get_parameter('variance_mag')
             node.get_logger().info('\tvariance_mag:\t\t"%s"' % self.variance_mag.value)
+            
+            self.imu_change_epsilon = node.get_parameter('imu_change_epsilon')
+            node.get_logger().info('\timu_change_epsilon:\t"%s"' % self.imu_change_epsilon.value)
+            self.imu_constant_threshold = node.get_parameter('imu_constant_threshold')
+            node.get_logger().info('\timu_constant_threshold:\t"%s"' % self.imu_constant_threshold.value)
+            self.imu_history_size = node.get_parameter('imu_history_size')
+            node.get_logger().info('\timu_history_size:\t\t"%s"' % self.imu_history_size.value)
+            self.max_std_dev_threshold = node.get_parameter('max_std_dev_threshold')
+            node.get_logger().info('\tmax_std_dev_threshold:\t"%s"' % self.max_std_dev_threshold.value)
         except Exception as e:  # noqa: B902
             node.get_logger().warn('Could not get parameters...setting variables to default')
             node.get_logger().warn('Error: "%s"' % e)
