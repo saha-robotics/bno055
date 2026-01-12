@@ -29,7 +29,7 @@ import json
 from math import sqrt
 import struct
 import sys
-from time import sleep
+from time import sleep, time
 
 from bno055 import registers
 from bno055.connectors.Connector import Connector
@@ -37,10 +37,11 @@ from bno055.params.NodeParameters import NodeParameters
 
 from geometry_msgs.msg import Quaternion, Vector3
 from rclpy.node import Node
-from rclpy.qos import QoSProfile
+from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Imu, MagneticField, Temperature
-from std_msgs.msg import String
+from std_msgs.msg import String, Bool
 from example_interfaces.srv import Trigger
+from robot_msgs.msg import Log, RosTopicsConfig
 
 
 class SensorService:
@@ -53,6 +54,11 @@ class SensorService:
 
         prefix = self.param.ros_topic_prefix.value
         QoSProf = QoSProfile(depth=10)
+        LatchQoSProf = QoSProfile(
+            depth=1,  
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST
+        )
 
         # create topic publishers:
         self.pub_imu_raw = node.create_publisher(Imu, prefix + 'imu_raw', QoSProf)
@@ -61,7 +67,29 @@ class SensorService:
         self.pub_grav = node.create_publisher(Vector3, prefix + 'grav', QoSProf)
         self.pub_temp = node.create_publisher(Temperature, prefix + 'temp', QoSProf)
         self.pub_calib_status = node.create_publisher(String, prefix + 'calib_status', QoSProf)
+        self.pub_imu_ok = node.create_publisher(Bool, prefix + 'imu_ok', LatchQoSProf)
+        self.pub_global_log = node.create_publisher(Log, RosTopicsConfig.LOGGING, 10)
         self.srv = self.node.create_service(Trigger, prefix + 'calibration_request', self.calibration_request_callback)
+
+        # IMU anomaly detection state variables
+        self.prev_accel_x = 0.0
+        self.prev_accel_y = 0.0
+        self.prev_accel_z = 0.0
+        self.prev_gyro_x = 0.0
+        self.prev_gyro_y = 0.0
+        self.prev_gyro_z = 0.0
+        self.prev_imu_time = None
+        self.imu_constant_count = 0
+        self.imu_ok = True
+        self.prev_imu_ok = True
+        
+        # History buffers for std dev calculation
+        self.accel_x_history = []
+        self.accel_y_history = []
+        self.accel_z_history = []
+        
+        # Log throttle map
+        self.log_throttle_map = {}
 
     def configure(self):
         """Configure the IMU sensor hardware."""
@@ -254,6 +282,115 @@ class SensorService:
         # temp_msg.header.seq = seq
         temp_msg.temperature = float(buf[44])
         self.pub_temp.publish(temp_msg)
+
+        # IMU anomaly detection
+        self._check_imu_anomalies(imu_msg)
+
+    def publish_log_throttled(self, log_key, log_message, log_type, timeout_sec):
+        current_time = time()
+        if log_key not in self.log_throttle_map or (current_time - self.log_throttle_map[log_key]) >= timeout_sec:
+            # Console logging
+            if log_type == Log.WARN:
+                self.node.get_logger().warn(log_message)
+            elif log_type == Log.ERROR:
+                self.node.get_logger().error(log_message)
+            else:
+                self.node.get_logger().info(log_message)
+            
+            # Topic logging
+            log_msg = Log()
+            log_msg.node = "bno055" # or self.node.get_name() but self.node.get_name() might be fully qualified
+            log_msg.type = log_type
+            log_msg.log = log_message
+            self.pub_global_log.publish(log_msg)
+            
+            self.log_throttle_map[log_key] = current_time
+
+    def _check_imu_anomalies(self, imu_msg):
+        """Check for IMU anomalies and publish imu_ok status."""
+        current_time = time()
+        
+        if self.prev_imu_time is not None:
+            # Check if IMU data is constant
+            is_constant = (
+                abs(imu_msg.linear_acceleration.x - self.prev_accel_x) < self.param.imu_change_epsilon.value and
+                abs(imu_msg.linear_acceleration.y - self.prev_accel_y) < self.param.imu_change_epsilon.value and
+                abs(imu_msg.linear_acceleration.z - self.prev_accel_z) < self.param.imu_change_epsilon.value and
+                abs(imu_msg.angular_velocity.x - self.prev_gyro_x) < self.param.imu_change_epsilon.value and
+                abs(imu_msg.angular_velocity.y - self.prev_gyro_y) < self.param.imu_change_epsilon.value and
+                abs(imu_msg.angular_velocity.z - self.prev_gyro_z) < self.param.imu_change_epsilon.value
+            )
+
+            if is_constant:
+                self.imu_constant_count += 1
+                if self.imu_constant_count >= self.param.imu_constant_threshold.value:
+                    freq = self.param.data_query_frequency.value if hasattr(self.param, 'data_query_frequency') else 100.0
+                    msg = (
+                        f"IMU anomaly detected: Data constant for {self.imu_constant_count / freq:.2f} seconds "
+                        f"(accel: {imu_msg.linear_acceleration.x:.3f}, {imu_msg.linear_acceleration.y:.3f}, {imu_msg.linear_acceleration.z:.3f} | "
+                        f"gyro: {imu_msg.angular_velocity.x:.3f}, {imu_msg.angular_velocity.y:.3f}, {imu_msg.angular_velocity.z:.3f})"
+                    )
+                    self.publish_log_throttled("imu_constant", msg, Log.WARN, 5.0)
+
+                    self.imu_ok = False
+            else:
+                self.imu_constant_count = 0
+                self.imu_ok = True
+
+        # Check for abnormal acceleration values using standard deviation
+        self.accel_x_history.append(imu_msg.linear_acceleration.x)
+        self.accel_y_history.append(imu_msg.linear_acceleration.y)
+        self.accel_z_history.append(imu_msg.linear_acceleration.z)
+
+        if len(self.accel_x_history) > self.param.imu_history_size.value:
+            self.accel_x_history.pop(0)
+            self.accel_y_history.pop(0)
+            self.accel_z_history.pop(0)
+
+        if len(self.accel_x_history) >= self.param.imu_history_size.value // 2:
+            # Calculate mean
+            mean_x = sum(self.accel_x_history) / len(self.accel_x_history)
+            mean_y = sum(self.accel_y_history) / len(self.accel_y_history)
+            mean_z = sum(self.accel_z_history) / len(self.accel_z_history)
+
+            # Calculate variance
+            variance_x = sum((x - mean_x) ** 2 for x in self.accel_x_history) / len(self.accel_x_history)
+            variance_y = sum((y - mean_y) ** 2 for y in self.accel_y_history) / len(self.accel_y_history)
+            variance_z = sum((z - mean_z) ** 2 for z in self.accel_z_history) / len(self.accel_z_history)
+
+            # Calculate standard deviation
+            std_dev_x = sqrt(variance_x)
+            std_dev_y = sqrt(variance_y)
+            std_dev_z = sqrt(variance_z)
+
+            if (std_dev_x > self.param.max_std_dev_threshold.value or
+                std_dev_y > self.param.max_std_dev_threshold.value or
+                std_dev_z > self.param.max_std_dev_threshold.value):
+                
+                msg = (
+                    f"IMU anomaly detected: Standard deviation too high (noisy/broken data). "
+                    f"Std Dev: ({std_dev_x:.4f}, {std_dev_y:.4f}, {std_dev_z:.4f}) | "
+                    f"Threshold: {self.param.max_std_dev_threshold.value:.2f} m/s² | "
+                    f"Mean: ({mean_x:.3f}, {mean_y:.3f}, {mean_z:.3f})"
+                )
+                self.publish_log_throttled("imu_std_dev", msg, Log.WARN, 5.0)
+                self.imu_ok = False
+
+        # Update previous values
+        self.prev_accel_x = imu_msg.linear_acceleration.x
+        self.prev_accel_y = imu_msg.linear_acceleration.y
+        self.prev_accel_z = imu_msg.linear_acceleration.z
+        self.prev_gyro_x = imu_msg.angular_velocity.x
+        self.prev_gyro_y = imu_msg.angular_velocity.y
+        self.prev_gyro_z = imu_msg.angular_velocity.z
+        self.prev_imu_time = current_time
+
+        # Publish imu_ok status only when it changes
+        if self.imu_ok != self.prev_imu_ok:
+            imu_ok_msg = Bool()
+            imu_ok_msg.data = self.imu_ok
+            self.pub_imu_ok.publish(imu_ok_msg)
+            self.prev_imu_ok = self.imu_ok
 
     def get_calib_status(self):
         """
