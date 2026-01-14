@@ -81,7 +81,7 @@ class SensorService:
         self.prev_imu_time = None
         self.imu_constant_count = 0
         self.imu_ok = True
-        self.prev_imu_ok = True
+        self.prev_imu_ok = False
         
         # History buffers for std dev calculation
         self.accel_x_history = []
