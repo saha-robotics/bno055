@@ -175,7 +175,12 @@ class SensorService:
         temp_msg = Temperature()
 
         # read from sensor
-        buf = self.con.receive(registers.BNO055_ACCEL_DATA_X_LSB_ADDR, 45)
+        try:
+            buf = self.con.receive(registers.BNO055_ACCEL_DATA_X_LSB_ADDR, 45)
+        except Exception as e:
+            self.imu_ok = False
+            self._publish_imu_ok()
+            raise e
         # Publish raw data
         imu_raw_msg.header.stamp = self.node.get_clock().now().to_msg()
         imu_raw_msg.header.frame_id = self.param.frame_id.value
@@ -386,6 +391,10 @@ class SensorService:
         self.prev_imu_time = current_time
 
         # Publish imu_ok status only when it changes
+        self._publish_imu_ok()
+
+    def _publish_imu_ok(self):
+        """Publish imu_ok status if it has changed."""
         if self.imu_ok != self.prev_imu_ok:
             imu_ok_msg = Bool()
             imu_ok_msg.data = self.imu_ok
