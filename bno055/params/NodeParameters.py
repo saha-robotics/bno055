@@ -106,6 +106,8 @@ class NodeParameters:
         node.declare_parameter('imu_constant_threshold', value=100)
         node.declare_parameter('imu_history_size', value=20)
         node.declare_parameter('max_std_dev_threshold', value=1.5)
+        # Timeout in seconds before marking IMU as not OK due to read errors
+        node.declare_parameter('imu_error_timeout', value=0.2)
 
         # get the parameters - requires CLI arguments '--ros-args --params-file <parameter file>'
         node.get_logger().info('Parameters set to:')
@@ -201,6 +203,8 @@ class NodeParameters:
             node.get_logger().info('\timu_history_size:\t\t"%s"' % self.imu_history_size.value)
             self.max_std_dev_threshold = node.get_parameter('max_std_dev_threshold')
             node.get_logger().info('\tmax_std_dev_threshold:\t"%s"' % self.max_std_dev_threshold.value)
+            self.imu_error_timeout = node.get_parameter('imu_error_timeout')
+            node.get_logger().info('\timu_error_timeout:\t"%s"' % self.imu_error_timeout.value)
         except Exception as e:  # noqa: B902
             node.get_logger().warn('Could not get parameters...setting variables to default')
             node.get_logger().warn('Error: "%s"' % e)

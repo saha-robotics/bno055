@@ -90,6 +90,10 @@ class SensorService:
         
         # Log throttle map
         self.log_throttle_map = {}
+        
+        # Error tracking for timeout-based imu_ok
+        self.first_error_time = None
+        self.last_successful_read_time = None
 
     def configure(self):
         """Configure the IMU sensor hardware."""
@@ -175,7 +179,28 @@ class SensorService:
         temp_msg = Temperature()
 
         # read from sensor
-        buf = self.con.receive(registers.BNO055_ACCEL_DATA_X_LSB_ADDR, 45)
+        try:
+            buf = self.con.receive(registers.BNO055_ACCEL_DATA_X_LSB_ADDR, 45)
+            # Successful read - reset error tracking
+            self.first_error_time = None
+            self.last_successful_read_time = time()
+        except Exception as e:
+            current_time = time()
+            if self.first_error_time is None:
+                self.first_error_time = current_time
+            
+            # Check if errors have persisted beyond timeout threshold
+            error_duration = current_time - self.first_error_time
+            if error_duration >= self.param.imu_error_timeout.value:
+                self.imu_ok = False
+                self._publish_imu_ok()
+                self.publish_log_throttled(
+                    "imu_read_error",
+                    f"IMU read error persisted for {error_duration:.2f}s: {e}",
+                    Log.ERROR,
+                    5.0
+                )
+            raise e
         # Publish raw data
         imu_raw_msg.header.stamp = self.node.get_clock().now().to_msg()
         imu_raw_msg.header.frame_id = self.param.frame_id.value
@@ -386,6 +411,10 @@ class SensorService:
         self.prev_imu_time = current_time
 
         # Publish imu_ok status only when it changes
+        self._publish_imu_ok()
+
+    def _publish_imu_ok(self):
+        """Publish imu_ok status if it has changed."""
         if self.imu_ok != self.prev_imu_ok:
             imu_ok_msg = Bool()
             imu_ok_msg.data = self.imu_ok
