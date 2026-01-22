@@ -90,6 +90,10 @@ class SensorService:
         
         # Log throttle map
         self.log_throttle_map = {}
+        
+        # Serial reset timeout tracking
+        self.last_successful_data_time = time()
+        self.reset_in_progress = False
 
     def configure(self):
         """Configure the IMU sensor hardware."""
@@ -165,8 +169,56 @@ class SensorService:
 
         self.node.get_logger().info('Bosch BNO055 IMU configuration complete.')
 
+    def _check_serial_timeout(self):
+        """Check if serial connection should be reset due to data timeout.
+        
+        :return: True if reset was triggered, False otherwise
+        """
+        timeout = self.param.serial_reset_timeout.value
+        if timeout <= 0.0:
+            return False  # Feature disabled
+        
+        current_time = time()
+        elapsed = current_time - self.last_successful_data_time
+        
+        if elapsed >= timeout and not self.reset_in_progress:
+            self.reset_in_progress = True
+            
+            # Set imu_ok to false when timeout occurs
+            if self.imu_ok:
+                self.imu_ok = False
+                imu_ok_msg = Bool()
+                imu_ok_msg.data = False
+                self.pub_imu_ok.publish(imu_ok_msg)
+                self.prev_imu_ok = False
+            
+            msg = (
+                f"Serial timeout detected: No data received for {elapsed:.2f} seconds "
+                f"(threshold: {timeout:.1f}s). Resetting serial connection..."
+            )
+            self.publish_log_throttled("serial_timeout", msg, Log.ERROR, 10.0)
+            
+            # Reset the connector
+            if self.con.reset():
+                # Reconfigure the sensor after reset
+                try:
+                    self.configure()
+                    self.last_successful_data_time = time()
+                    self.node.get_logger().info('Sensor reconfigured after serial reset')
+                except Exception as e:
+                    self.node.get_logger().error(f'Failed to reconfigure sensor after reset: {e}')
+            
+            self.reset_in_progress = False
+            return True
+        
+        return False
+
     def get_sensor_data(self):
         """Read IMU data from the sensor, parse and publish."""
+        # Check for serial reset timeout
+        if self._check_serial_timeout():
+            return  # Skip this cycle if reset was triggered
+        
         # Initialize ROS msgs
         imu_raw_msg = Imu()
         imu_msg = Imu()
@@ -176,6 +228,9 @@ class SensorService:
 
         # read from sensor
         buf = self.con.receive(registers.BNO055_ACCEL_DATA_X_LSB_ADDR, 45)
+        
+        # Update last successful data time
+        self.last_successful_data_time = time()
         # Publish raw data
         imu_raw_msg.header.stamp = self.node.get_clock().now().to_msg()
         imu_raw_msg.header.frame_id = self.param.frame_id.value

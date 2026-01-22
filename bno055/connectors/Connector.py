@@ -46,3 +46,7 @@ class Connector:
 
     def transmit(self, reg_addr, length, data: bytes):
         return self.write(reg_addr, length, data)
+
+    def reset(self):
+        """Reset the connection. Override in subclass."""
+        pass
