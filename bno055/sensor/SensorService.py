@@ -213,9 +213,9 @@ class SensorService:
                 try:
                     self.configure()
                     self.last_successful_data_time = time()
-                    self.node.get_logger().info('Sensor reconfigured after serial reset')
+                    self.publish_log_throttled("serial_reset_success", "Sensor reconfigured after serial reset", Log.INFO, 10.0)
                 except Exception as e:
-                    self.node.get_logger().error(f'Failed to reconfigure sensor after reset: {e}')
+                    self.publish_log_throttled("serial_reset_fail", f"Failed to reconfigure sensor after reset: {e}", Log.ERROR, 10.0)
             
             self.reset_in_progress = False
             return True
