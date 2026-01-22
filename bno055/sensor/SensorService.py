@@ -441,6 +441,10 @@ class SensorService:
         self.prev_imu_time = current_time
 
         # Publish imu_ok status only when it changes
+        self._publish_imu_ok()
+
+    def _publish_imu_ok(self):
+        """Publish imu_ok status if it has changed."""
         if self.imu_ok != self.prev_imu_ok:
             imu_ok_msg = Bool()
             imu_ok_msg.data = self.imu_ok
