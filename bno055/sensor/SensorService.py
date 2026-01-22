@@ -174,27 +174,36 @@ class SensorService:
         
         :return: True if reset was triggered, False otherwise
         """
-        timeout = self.param.serial_reset_timeout.value
-        if timeout <= 0.0:
-            return False  # Feature disabled
-        
         current_time = time()
         elapsed = current_time - self.last_successful_data_time
         
-        if elapsed >= timeout and not self.reset_in_progress:
-            self.reset_in_progress = True
-            
-            # Set imu_ok to false when timeout occurs
+        # Check imu_ok timeout (separate from serial reset timeout)
+        imu_ok_timeout = self.param.imu_ok_timeout.value
+        if imu_ok_timeout > 0.0 and elapsed >= imu_ok_timeout:
             if self.imu_ok:
                 self.imu_ok = False
                 imu_ok_msg = Bool()
                 imu_ok_msg.data = False
                 self.pub_imu_ok.publish(imu_ok_msg)
                 self.prev_imu_ok = False
+                
+                msg = (
+                    f"IMU data timeout: No data received for {elapsed:.2f} seconds "
+                    f"(threshold: {imu_ok_timeout:.1f}s). Setting imu_ok to false."
+                )
+                self.publish_log_throttled("imu_ok_timeout", msg, Log.WARN, 5.0)
+        
+        # Check serial reset timeout
+        serial_timeout = self.param.serial_reset_timeout.value
+        if serial_timeout <= 0.0:
+            return False  # Serial reset feature disabled
+        
+        if elapsed >= serial_timeout and not self.reset_in_progress:
+            self.reset_in_progress = True
             
             msg = (
                 f"Serial timeout detected: No data received for {elapsed:.2f} seconds "
-                f"(threshold: {timeout:.1f}s). Resetting serial connection..."
+                f"(threshold: {serial_timeout:.1f}s). Resetting serial connection..."
             )
             self.publish_log_throttled("serial_timeout", msg, Log.ERROR, 10.0)
             
@@ -441,10 +450,6 @@ class SensorService:
         self.prev_imu_time = current_time
 
         # Publish imu_ok status only when it changes
-        self._publish_imu_ok()
-
-    def _publish_imu_ok(self):
-        """Publish imu_ok status if it has changed."""
         if self.imu_ok != self.prev_imu_ok:
             imu_ok_msg = Bool()
             imu_ok_msg.data = self.imu_ok
