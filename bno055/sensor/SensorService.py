@@ -90,6 +90,10 @@ class SensorService:
         
         # Log throttle map
         self.log_throttle_map = {}
+        
+        # Serial reset timeout tracking
+        self.last_successful_data_time = time()
+        self.reset_in_progress = False
 
     def configure(self):
         """Configure the IMU sensor hardware."""
@@ -165,8 +169,65 @@ class SensorService:
 
         self.node.get_logger().info('Bosch BNO055 IMU configuration complete.')
 
+    def _check_serial_timeout(self):
+        """Check if serial connection should be reset due to data timeout.
+        
+        :return: True if reset was triggered, False otherwise
+        """
+        current_time = time()
+        elapsed = current_time - self.last_successful_data_time
+        
+        # Check imu_ok timeout (separate from serial reset timeout)
+        imu_ok_timeout = self.param.imu_ok_timeout.value
+        if imu_ok_timeout > 0.0 and elapsed >= imu_ok_timeout:
+            if self.imu_ok:
+                self.imu_ok = False
+                imu_ok_msg = Bool()
+                imu_ok_msg.data = False
+                self.pub_imu_ok.publish(imu_ok_msg)
+                self.prev_imu_ok = False
+                
+                msg = (
+                    f"IMU data timeout: No data received for {elapsed:.2f} seconds "
+                    f"(threshold: {imu_ok_timeout:.1f}s). Setting imu_ok to false."
+                )
+                self.publish_log_throttled("imu_ok_timeout", msg, Log.WARN, 5.0)
+        
+        # Check serial reset timeout
+        serial_timeout = self.param.serial_reset_timeout.value
+        if serial_timeout <= 0.0:
+            return False  # Serial reset feature disabled
+        
+        if elapsed >= serial_timeout and not self.reset_in_progress:
+            self.reset_in_progress = True
+            
+            msg = (
+                f"Serial timeout detected: No data received for {elapsed:.2f} seconds "
+                f"(threshold: {serial_timeout:.1f}s). Resetting serial connection..."
+            )
+            self.publish_log_throttled("serial_timeout", msg, Log.ERROR, 10.0)
+            
+            # Reset the connector
+            if self.con.reset():
+                # Reconfigure the sensor after reset
+                try:
+                    self.configure()
+                    self.last_successful_data_time = time()
+                    self.publish_log_throttled("serial_reset_success", "Sensor reconfigured after serial reset", Log.INFO, 10.0)
+                except Exception as e:
+                    self.publish_log_throttled("serial_reset_fail", f"Failed to reconfigure sensor after reset: {e}", Log.ERROR, 10.0)
+            
+            self.reset_in_progress = False
+            return True
+        
+        return False
+
     def get_sensor_data(self):
         """Read IMU data from the sensor, parse and publish."""
+        # Check for serial reset timeout
+        if self._check_serial_timeout():
+            return  # Skip this cycle if reset was triggered
+        
         # Initialize ROS msgs
         imu_raw_msg = Imu()
         imu_msg = Imu()
@@ -175,12 +236,10 @@ class SensorService:
         temp_msg = Temperature()
 
         # read from sensor
-        try:
-            buf = self.con.receive(registers.BNO055_ACCEL_DATA_X_LSB_ADDR, 45)
-        except Exception as e:
-            self.imu_ok = False
-            self._publish_imu_ok()
-            raise e
+        buf = self.con.receive(registers.BNO055_ACCEL_DATA_X_LSB_ADDR, 45)
+        
+        # Update last successful data time
+        self.last_successful_data_time = time()
         # Publish raw data
         imu_raw_msg.header.stamp = self.node.get_clock().now().to_msg()
         imu_raw_msg.header.frame_id = self.param.frame_id.value
@@ -391,10 +450,6 @@ class SensorService:
         self.prev_imu_time = current_time
 
         # Publish imu_ok status only when it changes
-        self._publish_imu_ok()
-
-    def _publish_imu_ok(self):
-        """Publish imu_ok status if it has changed."""
         if self.imu_ok != self.prev_imu_ok:
             imu_ok_msg = Bool()
             imu_ok_msg.data = self.imu_ok

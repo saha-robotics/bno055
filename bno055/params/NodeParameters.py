@@ -106,6 +106,12 @@ class NodeParameters:
         node.declare_parameter('imu_constant_threshold', value=100)
         node.declare_parameter('imu_history_size', value=20)
         node.declare_parameter('max_std_dev_threshold', value=1.5)
+        # IMU OK timeout: if no data received for this many seconds, set imu_ok to false
+        # Set to 0.0 to disable
+        node.declare_parameter('imu_ok_timeout', value=1.0)
+        # Serial reset timeout: if no data received for this many seconds, reset serial connection
+        # Set to 0.0 to disable
+        node.declare_parameter('serial_reset_timeout', value=5.0)
 
         # get the parameters - requires CLI arguments '--ros-args --params-file <parameter file>'
         node.get_logger().info('Parameters set to:')
@@ -201,6 +207,10 @@ class NodeParameters:
             node.get_logger().info('\timu_history_size:\t\t"%s"' % self.imu_history_size.value)
             self.max_std_dev_threshold = node.get_parameter('max_std_dev_threshold')
             node.get_logger().info('\tmax_std_dev_threshold:\t"%s"' % self.max_std_dev_threshold.value)
+            self.imu_ok_timeout = node.get_parameter('imu_ok_timeout')
+            node.get_logger().info('\timu_ok_timeout:\t\t"%s"' % self.imu_ok_timeout.value)
+            self.serial_reset_timeout = node.get_parameter('serial_reset_timeout')
+            node.get_logger().info('\tserial_reset_timeout:\t"%s"' % self.serial_reset_timeout.value)
         except Exception as e:  # noqa: B902
             node.get_logger().warn('Could not get parameters...setting variables to default')
             node.get_logger().warn('Error: "%s"' % e)

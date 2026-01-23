@@ -75,6 +75,22 @@ class UART(Connector):
             self.node.get_logger().info('Check to make sure your device is connected')
             sys.exit(1)
 
+    def reset(self):
+        """Reset the serial connection by closing and reopening it.
+        
+        :return: True if reset successful, False otherwise
+        """
+        self.node.get_logger().warn('Resetting serial connection on port: "%s"...' % self.port)
+        try:
+            if self.serialConnection is not None:
+                self.serialConnection.close()
+            self.serialConnection = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
+            self.node.get_logger().info('Serial connection reset successful')
+            return True
+        except serial.serialutil.SerialException as e:
+            self.node.get_logger().error('Failed to reset serial connection: %s' % e)
+            return False
+
     def read(self, reg_addr, length):
         """Read data from sensor via UART.
 
