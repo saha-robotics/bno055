@@ -33,6 +33,7 @@ from time import sleep, time
 
 from bno055 import registers
 from bno055.connectors.Connector import Connector
+from bno055.error_handling.exceptions import TransmissionException
 from bno055.params.NodeParameters import NodeParameters
 
 from geometry_msgs.msg import Quaternion, Vector3
@@ -94,9 +95,15 @@ class SensorService:
         # Serial reset timeout tracking
         self.last_successful_data_time = time()
         self.reset_in_progress = False
+        self.consecutive_error_count = 0
 
-    def configure(self):
-        """Configure the IMU sensor hardware."""
+    def configure(self, exit_on_error=True):
+        """Configure the IMU sensor hardware.
+        
+        Args:
+            exit_on_error: If True (default), calls sys.exit(1) on communication error.
+                          If False, raises the exception instead (used by watchdog reset).
+        """
         self.node.get_logger().info('Configuring device...')
         try:
             data = self.con.receive(registers.BNO055_CHIP_ID_ADDR, 1)
@@ -106,8 +113,11 @@ class SensorService:
         except Exception as e:  # noqa: B902
             # This is the first communication - exit if it does not work
             self.node.get_logger().error('Communication error: %s' % e)
-            self.node.get_logger().error('Shutting down ROS node...')
-            sys.exit(1)
+            if exit_on_error:
+                self.node.get_logger().error('Shutting down ROS node...')
+                sys.exit(1)
+            else:
+                raise  # Re-raise exception for caller to handle
 
         # IMU connected => apply IMU Configuration:
         if not (self.con.transmit(registers.BNO055_OPR_MODE_ADDR, 1, bytes([registers.OPERATION_MODE_CONFIG]))):
@@ -169,15 +179,18 @@ class SensorService:
 
         self.node.get_logger().info('Bosch BNO055 IMU configuration complete.')
 
-    def _check_serial_timeout(self):
-        """Check if serial connection should be reset due to data timeout.
+    def check_watchdog(self):
+        """Independent watchdog check - can be called from a separate timer.
         
-        :return: True if reset was triggered, False otherwise
+        This method is designed to be called independently of the main data query loop.
+        It checks for serial timeout conditions and triggers reset if needed.
+        Unlike _check_serial_timeout which is called from get_sensor_data, this can
+        detect timeouts even when the serial read is blocking.
         """
         current_time = time()
         elapsed = current_time - self.last_successful_data_time
         
-        # Check imu_ok timeout (separate from serial reset timeout)
+        # Check imu_ok timeout
         imu_ok_timeout = self.param.imu_ok_timeout.value
         if imu_ok_timeout > 0.0 and elapsed >= imu_ok_timeout:
             if self.imu_ok:
@@ -188,46 +201,37 @@ class SensorService:
                 self.prev_imu_ok = False
                 
                 msg = (
-                    f"IMU data timeout: No data received for {elapsed:.2f} seconds "
+                    f"[Watchdog] IMU data timeout: No data received for {elapsed:.2f} seconds "
                     f"(threshold: {imu_ok_timeout:.1f}s). Setting imu_ok to false."
                 )
-                self.publish_log_throttled("imu_ok_timeout", msg, Log.WARN, 5.0)
+                self.publish_log_throttled("watchdog_imu_ok_timeout", msg, Log.WARN, 5.0)
         
         # Check serial reset timeout
         serial_timeout = self.param.serial_reset_timeout.value
-        if serial_timeout <= 0.0:
-            return False  # Serial reset feature disabled
-        
-        if elapsed >= serial_timeout and not self.reset_in_progress:
+        if serial_timeout > 0.0 and elapsed >= serial_timeout and not self.reset_in_progress:
             self.reset_in_progress = True
             
-            msg = (
-                f"Serial timeout detected: No data received for {elapsed:.2f} seconds "
-                f"(threshold: {serial_timeout:.1f}s). Resetting serial connection..."
-            )
-            self.publish_log_throttled("serial_timeout", msg, Log.ERROR, 10.0)
-            
-            # Reset the connector
-            if self.con.reset():
-                # Reconfigure the sensor after reset
-                try:
-                    self.configure()
-                    self.last_successful_data_time = time()
-                    self.publish_log_throttled("serial_reset_success", "Sensor reconfigured after serial reset", Log.INFO, 10.0)
-                except Exception as e:
-                    self.publish_log_throttled("serial_reset_fail", f"Failed to reconfigure sensor after reset: {e}", Log.ERROR, 10.0)
-            
-            self.reset_in_progress = False
-            return True
-        
-        return False
+            try:
+                msg = (
+                    f"[Watchdog] Serial timeout detected: No data received for {elapsed:.2f} seconds "
+                    f"(threshold: {serial_timeout:.1f}s). Resetting serial connection..."
+                )
+                self.publish_log_throttled("watchdog_serial_reset", msg, Log.ERROR, 10.0)
+                
+                # Reset the connector
+                if self.con.reset():
+                    try:
+                        self.configure(exit_on_error=False)
+                        self.last_successful_data_time = time()
+                        self.consecutive_error_count = 0
+                        self.publish_log_throttled("watchdog_reset_success", "Sensor reconfigured after watchdog reset", Log.INFO, 10.0)
+                    except Exception as e:
+                        self.publish_log_throttled("watchdog_reset_fail", f"Failed to reconfigure sensor after watchdog reset: {e}", Log.ERROR, 10.0)
+            finally:
+                self.reset_in_progress = False
 
     def get_sensor_data(self):
         """Read IMU data from the sensor, parse and publish."""
-        # Check for serial reset timeout
-        if self._check_serial_timeout():
-            return  # Skip this cycle if reset was triggered
-        
         # Initialize ROS msgs
         imu_raw_msg = Imu()
         imu_msg = Imu()
@@ -240,6 +244,7 @@ class SensorService:
         
         # Update last successful data time
         self.last_successful_data_time = time()
+        self.consecutive_error_count = 0
         # Publish raw data
         imu_raw_msg.header.stamp = self.node.get_clock().now().to_msg()
         imu_raw_msg.header.frame_id = self.param.frame_id.value
