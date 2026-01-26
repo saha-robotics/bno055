@@ -142,6 +142,19 @@ def main(args=None):
             finally:
                 lock.release()
 
+        def watchdog_check():
+            """Independent watchdog timer - runs even if data query is blocked.
+            
+            This checks for serial timeout independently of the main data query loop.
+            If serial read is blocking (waiting for data that never comes), this will
+            still detect the timeout and trigger a reset.
+            """
+            try:
+                node.sensor.check_watchdog()
+            except Exception as e:
+                node.get_logger().warn('Watchdog check failed with %s:"%s"'
+                                       % (type(e).__name__, e))
+
         # start regular sensor transmissions:
         # please be aware that frequencies around 30Hz and above might cause performance impacts:
         # https://github.com/ros2/rclpy/issues/520
@@ -151,6 +164,11 @@ def main(args=None):
         # start regular calibration status logging
         f = 1.0 / float(node.param.calib_status_frequency.value)
         status_timer = node.create_timer(f, log_calibration_status)
+
+        # start independent watchdog timer (runs every 0.5 seconds)
+        # This timer runs independently of the lock and can detect timeouts
+        # even when the main data query is blocked waiting for serial data
+        watchdog_timer = node.create_timer(0.5, watchdog_check)
 
         rclpy.spin(node)
 
@@ -162,6 +180,7 @@ def main(args=None):
         try:
             node.destroy_timer(data_query_timer)
             node.destroy_timer(status_timer)
+            node.destroy_timer(watchdog_timer)
         except UnboundLocalError:
             node.get_logger().info('No timers to shutdown')
         node.destroy_node()

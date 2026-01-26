@@ -111,7 +111,7 @@ class NodeParameters:
         node.declare_parameter('imu_ok_timeout', value=1.0)
         # Serial reset timeout: if no data received for this many seconds, reset serial connection
         # Set to 0.0 to disable
-        node.declare_parameter('serial_reset_timeout', value=5.0)
+        node.declare_parameter('serial_reset_timeout', value=0.2)
 
         # get the parameters - requires CLI arguments '--ros-args --params-file <parameter file>'
         node.get_logger().info('Parameters set to:')
