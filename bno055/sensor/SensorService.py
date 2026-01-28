@@ -179,6 +179,19 @@ class SensorService:
 
         self.node.get_logger().info('Bosch BNO055 IMU configuration complete.')
 
+    def _set_imu_ok(self, value: bool):
+        """Set the imu_ok flag and publish the status.
+        
+        Args:
+            value: The new imu_ok state (True/False)
+        """
+        if self.imu_ok != value:
+            self.imu_ok = value
+            imu_ok_msg = Bool()
+            imu_ok_msg.data = value
+            self.pub_imu_ok.publish(imu_ok_msg)
+            self.prev_imu_ok = value
+
     def check_watchdog(self):
         """Independent watchdog check - can be called from a separate timer.
         
@@ -194,12 +207,7 @@ class SensorService:
         imu_ok_timeout = self.param.imu_ok_timeout.value
         if imu_ok_timeout > 0.0 and elapsed >= imu_ok_timeout:
             if self.imu_ok:
-                self.imu_ok = False
-                imu_ok_msg = Bool()
-                imu_ok_msg.data = False
-                self.pub_imu_ok.publish(imu_ok_msg)
-                self.prev_imu_ok = False
-                
+                self._set_imu_ok(False)
                 msg = (
                     f"[Watchdog] IMU data timeout: No data received for {elapsed:.2f} seconds "
                     f"(threshold: {imu_ok_timeout:.1f}s). Setting imu_ok to false."
@@ -223,10 +231,13 @@ class SensorService:
                     try:
                         self.configure(exit_on_error=False)
                         self.last_successful_data_time = time()
-                        self.consecutive_error_count = 0
                         self.publish_log_throttled("watchdog_reset_success", "Sensor reconfigured after watchdog reset", Log.INFO, 10.0)
                     except Exception as e:
+                        self._set_imu_ok(False)
                         self.publish_log_throttled("watchdog_reset_fail", f"Failed to reconfigure sensor after watchdog reset: {e}", Log.ERROR, 10.0)
+                else:
+                    self._set_imu_ok(False)
+                    self.publish_log_throttled("watchdog_reset_fail", "Failed to reset serial connection", Log.ERROR, 10.0)
             finally:
                 self.reset_in_progress = False
 
