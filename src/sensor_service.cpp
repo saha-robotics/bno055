@@ -133,8 +133,10 @@ bool SensorService::configure()
 
   // Set calibration offsets if configured
   if (config_.set_offsets) {
-    // Switch to config mode for setting offsets
-    set_mode(OPERATION_MODE_CONFIG);
+    // Switch to config mode for setting offsets (already in config mode, but being explicit)
+    if (!set_mode(OPERATION_MODE_CONFIG)) {
+      RCLCPP_WARN(node_->get_logger(), "Unable to re-enter config mode for offset setting");
+    }
 
     // Write offsets (simplified - in production you'd read current values first)
     RCLCPP_INFO(node_->get_logger(), "Setting calibration offsets");
@@ -311,7 +313,8 @@ void SensorService::get_calib_status()
   calib_msg.data = ss.str();
   pub_calib_status_->publish(calib_msg);
 
-  RCLCPP_INFO(node_->get_logger(), "Calibration: %s", ss.str().c_str());
+  // Log at DEBUG level to avoid spam at 10Hz, or use throttle
+  RCLCPP_DEBUG(node_->get_logger(), "Calibration: %s", ss.str().c_str());
 }
 
 void SensorService::check_watchdog()

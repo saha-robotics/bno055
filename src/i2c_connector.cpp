@@ -99,15 +99,17 @@ bool I2CConnector::read(uint8_t reg_addr, std::vector<uint8_t> & data, size_t le
   size_t bytes_left = length;
   size_t offset = 0;
 
+  // BNO055 supports auto-incrementing register reads, so we can read
+  // consecutive registers in chunks of up to 32 bytes
   while (bytes_left > 0) {
     size_t read_len = std::min(bytes_left, size_t(32));
     
-    // Write register address
+    // Write register address to set read pointer
     if (::write(fd_, &reg_addr, 1) != 1) {
       return false;
     }
 
-    // Read data
+    // Read data - BNO055 will auto-increment register address
     if (::read(fd_, data.data() + offset, read_len) != static_cast<ssize_t>(read_len)) {
       return false;
     }

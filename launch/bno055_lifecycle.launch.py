@@ -54,6 +54,8 @@ def generate_launch_description():
     )
     
     # When the node reaches the 'inactive' state, automatically activate it
+    # Note: Using name-based matching for lifecycle node identification as
+    # recommended by ROS2 lifecycle launch patterns
     register_event_handler_for_inactive_to_active = RegisterEventHandler(
         OnStateTransition(
             target_lifecycle_node=lifecycle_node,
@@ -71,6 +73,7 @@ def generate_launch_description():
     )
     
     # When the node is created, trigger configuration
+    # Name-based matching ensures the correct node receives the transition event
     emit_event_to_request_that_lifecycle_node_does_configure_transition = EmitEvent(
         event=ChangeState(
             lifecycle_node_matcher=lambda node: node.name == lifecycle_node.name,

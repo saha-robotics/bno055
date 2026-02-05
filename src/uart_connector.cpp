@@ -50,10 +50,17 @@ UARTConnector::~UARTConnector()
 
 bool UARTConnector::connect()
 {
-  fd_ = open(port_.c_str(), O_RDWR | O_NOCTTY);
+  // Open with non-blocking flag to prevent blocking on port availability
+  fd_ = open(port_.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
   
   if (fd_ < 0) {
     return false;
+  }
+
+  // Clear O_NONBLOCK after opening to allow blocking reads with timeout
+  int flags = fcntl(fd_, F_GETFL, 0);
+  if (flags != -1) {
+    fcntl(fd_, F_SETFL, flags & ~O_NONBLOCK);
   }
 
   struct termios tty;
