@@ -103,7 +103,7 @@ bool I2CConnector::read(uint8_t reg_addr, std::vector<uint8_t> & data, size_t le
     size_t read_len = std::min(bytes_left, size_t(32));
     
     // Write register address
-    if (write(fd_, &reg_addr, 1) != 1) {
+    if (::write(fd_, &reg_addr, 1) != 1) {
       return false;
     }
 

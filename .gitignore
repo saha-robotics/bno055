@@ -3,3 +3,9 @@
 /venv
 .vscode/
 docs/html
+build/
+install/
+log/
+*.pyc
+*.pyo
+

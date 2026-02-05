@@ -45,11 +45,6 @@ ament_target_dependencies(bno055_lifecycle_node
   example_interfaces
 )
 
-# Link i2c library
-target_link_libraries(bno055_lifecycle_node
-  i2c
-)
-
 # Install C++ executables
 install(TARGETS
   bno055_lifecycle_node
