@@ -125,11 +125,11 @@ bool SensorService::configure()
   // Verify self-test result
   std::vector<uint8_t> self_test;
   if (read_register(BNO055_SELFTEST_RESULT_ADDR, self_test, 1)) {
-    if ((self_test[0] & 0x0F) != 0x0F) {
+    if ((self_test[0] & SELFTEST_ALL_PASSED) != SELFTEST_ALL_PASSED) {
       RCLCPP_WARN(node_->get_logger(),
-        "Self-test incomplete: 0x%02X (expected 0x0F) - "
+        "Self-test incomplete: 0x%02X (expected 0x%02X) - "
         "ACC:%s MAG:%s GYR:%s MCU:%s",
-        self_test[0],
+        self_test[0], SELFTEST_ALL_PASSED,
         (self_test[0] & 0x01) ? "OK" : "FAIL",
         (self_test[0] & 0x02) ? "OK" : "FAIL",
         (self_test[0] & 0x04) ? "OK" : "FAIL",
@@ -400,9 +400,9 @@ void SensorService::check_watchdog()
     }
     
     // Self test result: bit 0=accelerometer, 1=magnetometer, 2=gyroscope, 3=MCU
-    if (self_test[0] != 0x0F) {
+    if (self_test[0] != SELFTEST_ALL_PASSED) {
       RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 10000,
-        "Self-test failed: 0x%02X (expected 0x0F)", self_test[0]);
+        "Self-test failed: 0x%02X (expected 0x%02X)", self_test[0], SELFTEST_ALL_PASSED);
     }
   }
 
@@ -456,7 +456,10 @@ void SensorService::write_offset(uint8_t reg_lsb, int16_t value)
     static_cast<uint8_t>(value & 0xFF),
     static_cast<uint8_t>((value >> 8) & 0xFF)
   };
-  write_register(reg_lsb, data);
+  if (!write_register(reg_lsb, data)) {
+    RCLCPP_WARN(node_->get_logger(),
+      "Failed to write offset at register 0x%02X (value: %d)", reg_lsb, value);
+  }
 }
 
 bool SensorService::read_register(uint8_t reg, std::vector<uint8_t> & data, size_t length)
@@ -480,22 +483,23 @@ bool SensorService::is_fully_calibrated(
 {
   switch (config_.operation_mode) {
     case OPERATION_MODE_ACCONLY:
-      return (accel == 3);
+      return (accel == CALIBRATION_FULLY_CALIBRATED);
     case OPERATION_MODE_MAGONLY:
-      return (mag == 3);
+      return (mag == CALIBRATION_FULLY_CALIBRATED);
     case OPERATION_MODE_GYRONLY:
     case OPERATION_MODE_M4G:
-      return (gyro == 3);
+      return (gyro == CALIBRATION_FULLY_CALIBRATED);
     case OPERATION_MODE_ACCMAG:
     case OPERATION_MODE_COMPASS:
-      return (accel == 3 && mag == 3);
+      return (accel == CALIBRATION_FULLY_CALIBRATED && mag == CALIBRATION_FULLY_CALIBRATED);
     case OPERATION_MODE_ACCGYRO:
     case OPERATION_MODE_IMUPLUS:
-      return (accel == 3 && gyro == 3);
+      return (accel == CALIBRATION_FULLY_CALIBRATED && gyro == CALIBRATION_FULLY_CALIBRATED);
     case OPERATION_MODE_MAGGYRO:
-      return (mag == 3 && gyro == 3);
+      return (mag == CALIBRATION_FULLY_CALIBRATED && gyro == CALIBRATION_FULLY_CALIBRATED);
     default:
-      return (sys == 3 && gyro == 3 && accel == 3 && mag == 3);
+      return (sys == CALIBRATION_FULLY_CALIBRATED && gyro == CALIBRATION_FULLY_CALIBRATED &&
+              accel == CALIBRATION_FULLY_CALIBRATED && mag == CALIBRATION_FULLY_CALIBRATED);
   }
 }
 
