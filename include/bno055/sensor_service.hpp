@@ -99,6 +99,7 @@ private:
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::Imu>> pub_imu_raw_;
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::MagneticField>> pub_mag_;
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::Vector3>> pub_grav_;
+  std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::Vector3>> pub_euler_;
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::Temperature>> pub_temp_;
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::String>> pub_calib_status_;
 
@@ -113,7 +114,9 @@ private:
   bool set_mode(uint8_t mode);
   bool read_register(uint8_t reg, std::vector<uint8_t> & data, size_t length);
   bool write_register(uint8_t reg, const std::vector<uint8_t> & data);
+  void write_offset(uint8_t reg_lsb, int16_t value);
   int16_t bytes_to_int16(const std::vector<uint8_t> & data, size_t offset);
+  bool is_fully_calibrated(uint8_t sys, uint8_t gyro, uint8_t accel, uint8_t mag) const;
   void calibration_request_callback(
     const std::shared_ptr<example_interfaces::srv::Trigger::Request> request,
     std::shared_ptr<example_interfaces::srv::Trigger::Response> response);

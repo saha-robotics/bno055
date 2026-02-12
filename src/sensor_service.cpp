@@ -29,8 +29,11 @@
 #include "bno055/sensor_service.hpp"
 #include "bno055/registers.hpp"
 #include <cmath>
+#include <map>
 #include <sstream>
 #include <iomanip>
+#include <thread>
+#include <chrono>
 
 namespace bno055
 {
@@ -55,6 +58,8 @@ SensorService::SensorService(
     config_.topic_prefix + "mag", 10);
   pub_grav_ = node_->create_publisher<geometry_msgs::msg::Vector3>(
     config_.topic_prefix + "grav", 10);
+  pub_euler_ = node_->create_publisher<geometry_msgs::msg::Vector3>(
+    config_.topic_prefix + "euler", 10);
   pub_temp_ = node_->create_publisher<sensor_msgs::msg::Temperature>(
     config_.topic_prefix + "temp", 10);
   pub_calib_status_ = node_->create_publisher<std_msgs::msg::String>(
@@ -70,6 +75,14 @@ SensorService::SensorService(
 bool SensorService::configure()
 {
   RCLCPP_INFO(node_->get_logger(), "Configuring device...");
+
+  // Reset the sensor for a clean state
+  RCLCPP_INFO(node_->get_logger(), "Resetting sensor...");
+  std::vector<uint8_t> page_zero = {0x00};
+  write_register(BNO055_PAGE_ID_ADDR, page_zero);
+  std::vector<uint8_t> reset_trigger = {0x20};
+  write_register(BNO055_SYS_TRIGGER_ADDR, reset_trigger);
+  std::this_thread::sleep_for(std::chrono::milliseconds(650));
 
   // Verify chip ID
   std::vector<uint8_t> chip_id;
@@ -94,6 +107,7 @@ bool SensorService::configure()
   if (!write_register(BNO055_PWR_MODE_ADDR, power_mode)) {
     RCLCPP_WARN(node_->get_logger(), "Unable to set IMU normal power mode");
   }
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
   // Set register page 0
   std::vector<uint8_t> page = {0x00};
@@ -101,10 +115,28 @@ bool SensorService::configure()
     RCLCPP_WARN(node_->get_logger(), "Unable to set IMU register page 0");
   }
 
-  // System trigger
+  // System trigger - clear reset
   std::vector<uint8_t> trigger = {0x00};
   if (!write_register(BNO055_SYS_TRIGGER_ADDR, trigger)) {
     RCLCPP_WARN(node_->get_logger(), "Unable to start IMU");
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // Verify self-test result
+  std::vector<uint8_t> self_test;
+  if (read_register(BNO055_SELFTEST_RESULT_ADDR, self_test, 1)) {
+    if ((self_test[0] & 0x0F) != 0x0F) {
+      RCLCPP_WARN(node_->get_logger(),
+        "Self-test incomplete: 0x%02X (expected 0x0F) - "
+        "ACC:%s MAG:%s GYR:%s MCU:%s",
+        self_test[0],
+        (self_test[0] & 0x01) ? "OK" : "FAIL",
+        (self_test[0] & 0x02) ? "OK" : "FAIL",
+        (self_test[0] & 0x04) ? "OK" : "FAIL",
+        (self_test[0] & 0x08) ? "OK" : "FAIL");
+    } else {
+      RCLCPP_INFO(node_->get_logger(), "Self-test passed (all sensors OK)");
+    }
   }
 
   // Set units: Android orientation mode, degrees, Celsius
@@ -133,25 +165,43 @@ bool SensorService::configure()
 
   // Set calibration offsets if configured
   if (config_.set_offsets) {
-    // Switch to config mode for setting offsets (already in config mode, but being explicit)
-    if (!set_mode(OPERATION_MODE_CONFIG)) {
-      RCLCPP_WARN(node_->get_logger(), "Unable to re-enter config mode for offset setting");
+    RCLCPP_INFO(node_->get_logger(), "Writing calibration offsets to sensor registers");
+
+    if (config_.offset_acc.size() >= 3) {
+      write_offset(ACCEL_OFFSET_X_LSB_ADDR, config_.offset_acc[0]);
+      write_offset(ACCEL_OFFSET_Y_LSB_ADDR, config_.offset_acc[1]);
+      write_offset(ACCEL_OFFSET_Z_LSB_ADDR, config_.offset_acc[2]);
+      RCLCPP_INFO(node_->get_logger(), "  Accel offsets: [%d, %d, %d]",
+        config_.offset_acc[0], config_.offset_acc[1], config_.offset_acc[2]);
     }
 
-    // Write offsets (simplified - in production you'd read current values first)
-    RCLCPP_INFO(node_->get_logger(), "Setting calibration offsets");
-    
-    // Set operation mode
-    if (!set_mode(config_.operation_mode)) {
-      RCLCPP_WARN(node_->get_logger(), "Unable to set IMU operation mode");
-      return false;
+    if (config_.offset_mag.size() >= 3) {
+      write_offset(MAG_OFFSET_X_LSB_ADDR, config_.offset_mag[0]);
+      write_offset(MAG_OFFSET_Y_LSB_ADDR, config_.offset_mag[1]);
+      write_offset(MAG_OFFSET_Z_LSB_ADDR, config_.offset_mag[2]);
+      RCLCPP_INFO(node_->get_logger(), "  Mag offsets: [%d, %d, %d]",
+        config_.offset_mag[0], config_.offset_mag[1], config_.offset_mag[2]);
     }
-  } else {
-    // Set operation mode
-    if (!set_mode(config_.operation_mode)) {
-      RCLCPP_WARN(node_->get_logger(), "Unable to set IMU operation mode");
-      return false;
+
+    if (config_.offset_gyr.size() >= 3) {
+      write_offset(GYRO_OFFSET_X_LSB_ADDR, config_.offset_gyr[0]);
+      write_offset(GYRO_OFFSET_Y_LSB_ADDR, config_.offset_gyr[1]);
+      write_offset(GYRO_OFFSET_Z_LSB_ADDR, config_.offset_gyr[2]);
+      RCLCPP_INFO(node_->get_logger(), "  Gyro offsets: [%d, %d, %d]",
+        config_.offset_gyr[0], config_.offset_gyr[1], config_.offset_gyr[2]);
     }
+
+    // Write accelerometer and magnetometer radius
+    write_offset(ACCEL_RADIUS_LSB_ADDR, config_.radius_acc);
+    write_offset(MAG_RADIUS_LSB_ADDR, config_.radius_mag);
+    RCLCPP_INFO(node_->get_logger(), "  Accel radius: %d, Mag radius: %d",
+      config_.radius_acc, config_.radius_mag);
+  }
+
+  // Set operation mode
+  if (!set_mode(config_.operation_mode)) {
+    RCLCPP_WARN(node_->get_logger(), "Unable to set IMU operation mode");
+    return false;
   }
 
   RCLCPP_INFO(node_->get_logger(), "Bosch BNO055 IMU configuration complete");
@@ -164,6 +214,7 @@ void SensorService::activate_publishers()
   pub_imu_raw_->on_activate();
   pub_mag_->on_activate();
   pub_grav_->on_activate();
+  pub_euler_->on_activate();
   pub_temp_->on_activate();
   pub_calib_status_->on_activate();
 }
@@ -174,6 +225,7 @@ void SensorService::deactivate_publishers()
   pub_imu_raw_->on_deactivate();
   pub_mag_->on_deactivate();
   pub_grav_->on_deactivate();
+  pub_euler_->on_deactivate();
   pub_temp_->on_deactivate();
   pub_calib_status_->on_deactivate();
 }
@@ -287,6 +339,13 @@ void SensorService::get_sensor_data()
   temp_msg.header.frame_id = config_.frame_id;
   temp_msg.temperature = static_cast<double>(buf[44]);
   pub_temp_->publish(temp_msg);
+
+  // Publish Euler angles (indices 18-23: heading, roll, pitch)
+  auto euler_msg = geometry_msgs::msg::Vector3();
+  euler_msg.x = bytes_to_int16(buf, 18) / 16.0;  // heading (degrees)
+  euler_msg.y = bytes_to_int16(buf, 20) / 16.0;  // roll (degrees)
+  euler_msg.z = bytes_to_int16(buf, 22) / 16.0;  // pitch (degrees)
+  pub_euler_->publish(euler_msg);
 }
 
 void SensorService::get_calib_status()
@@ -303,11 +362,14 @@ void SensorService::get_calib_status()
   uint8_t accel = (calib_data[0] >> 2) & 0x03;
   uint8_t mag = calib_data[0] & 0x03;
 
+  bool fully_calibrated = is_fully_calibrated(sys, gyro, accel, mag);
+
   std::stringstream ss;
   ss << "{\"sys\": " << static_cast<int>(sys)
      << ", \"gyro\": " << static_cast<int>(gyro)
      << ", \"accel\": " << static_cast<int>(accel)
-     << ", \"mag\": " << static_cast<int>(mag) << "}";
+     << ", \"mag\": " << static_cast<int>(mag)
+     << ", \"fully_calibrated\": " << (fully_calibrated ? "true" : "false") << "}";
 
   auto calib_msg = std_msgs::msg::String();
   calib_msg.data = ss.str();
@@ -382,7 +444,19 @@ void SensorService::calibration_request_callback(
 bool SensorService::set_mode(uint8_t mode)
 {
   std::vector<uint8_t> data = {mode};
-  return write_register(BNO055_OPR_MODE_ADDR, data);
+  bool result = write_register(BNO055_OPR_MODE_ADDR, data);
+  // BNO055 requires a delay after mode transition (per datasheet: 19ms typical)
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
+  return result;
+}
+
+void SensorService::write_offset(uint8_t reg_lsb, int16_t value)
+{
+  std::vector<uint8_t> data = {
+    static_cast<uint8_t>(value & 0xFF),
+    static_cast<uint8_t>((value >> 8) & 0xFF)
+  };
+  write_register(reg_lsb, data);
 }
 
 bool SensorService::read_register(uint8_t reg, std::vector<uint8_t> & data, size_t length)
@@ -399,6 +473,30 @@ bool SensorService::write_register(uint8_t reg, const std::vector<uint8_t> & dat
     return false;
   }
   return connector_->write(reg, data);
+}
+
+bool SensorService::is_fully_calibrated(
+  uint8_t sys, uint8_t gyro, uint8_t accel, uint8_t mag) const
+{
+  switch (config_.operation_mode) {
+    case OPERATION_MODE_ACCONLY:
+      return (accel == 3);
+    case OPERATION_MODE_MAGONLY:
+      return (mag == 3);
+    case OPERATION_MODE_GYRONLY:
+    case OPERATION_MODE_M4G:
+      return (gyro == 3);
+    case OPERATION_MODE_ACCMAG:
+    case OPERATION_MODE_COMPASS:
+      return (accel == 3 && mag == 3);
+    case OPERATION_MODE_ACCGYRO:
+    case OPERATION_MODE_IMUPLUS:
+      return (accel == 3 && gyro == 3);
+    case OPERATION_MODE_MAGGYRO:
+      return (mag == 3 && gyro == 3);
+    default:
+      return (sys == 3 && gyro == 3 && accel == 3 && mag == 3);
+  }
 }
 
 int16_t SensorService::bytes_to_int16(const std::vector<uint8_t> & data, size_t offset)
