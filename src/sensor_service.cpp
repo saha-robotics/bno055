@@ -434,6 +434,8 @@ void SensorService::check_watchdog()
   }
 
   // Check serial reset timeout - reset connection and reconfigure sensor
+  // Uses a cooldown period: after a failed attempt, waits before trying again
+  // to avoid rapid reset loops that could worsen cable contact issues
   if (config_.serial_reset_timeout > 0.0 && elapsed >= config_.serial_reset_timeout
       && !reset_in_progress_)
   {
@@ -446,7 +448,7 @@ void SensorService::check_watchdog()
          << config_.serial_reset_timeout << "s). Resetting serial connection...";
       log_throttled("watchdog_serial_reset", ss.str(), 2, 10.0);
 
-      // Reset the connector (close + reopen)
+      // Reset the connector (close + reopen + BNO055 hardware reset)
       if (connector_ && connector_->reset()) {
         // Reconfigure the sensor after reset
         if (configure()) {
@@ -463,12 +465,21 @@ void SensorService::check_watchdog()
         } else {
           set_imu_ok(false);
           log_throttled("watchdog_reconfig_fail",
-            "Failed to reconfigure sensor after watchdog reset", 2, 10.0);
+            "Failed to reconfigure sensor after watchdog reset - will retry next cycle", 2, 10.0);
+          // Push last_successful_read_ forward by a cooldown period so the
+          // watchdog doesn't immediately retry. This gives time for the cable
+          // to stabilize if it was an intermittent contact issue.
+          last_successful_read_ = std::chrono::steady_clock::now() -
+            std::chrono::milliseconds(static_cast<int>(config_.serial_reset_timeout * 500));
         }
       } else {
         set_imu_ok(false);
         log_throttled("watchdog_reset_fail",
-          "Failed to reset serial connection", 2, 10.0);
+          "Failed to reset serial connection - will retry next cycle", 2, 10.0);
+        // Apply cooldown: set last_successful_read_ so next retry happens
+        // after ~half the serial_reset_timeout (not immediately)
+        last_successful_read_ = std::chrono::steady_clock::now() -
+          std::chrono::milliseconds(static_cast<int>(config_.serial_reset_timeout * 500));
       }
     } catch (const std::exception & e) {
       set_imu_ok(false);
@@ -480,23 +491,26 @@ void SensorService::check_watchdog()
   }
 
   // Check for connection issues based on system status and self test
-  std::vector<uint8_t> sys_status, sys_err, self_test;
+  // Only check if we're not in a timeout state (no point reading registers if connection is down)
+  if (elapsed < config_.serial_reset_timeout) {
+    std::vector<uint8_t> sys_status, sys_err, self_test;
   
-  if (read_register(BNO055_SYS_STAT_ADDR, sys_status, 1) &&
-      read_register(BNO055_SYS_ERR_ADDR, sys_err, 1) &&
-      read_register(BNO055_SELFTEST_RESULT_ADDR, self_test, 1))
-  {
-    // System status: 0=idle, 1=sys error, 2=init peripheral, 3=init system,
-    //                4=executing, 5=running, 6=running without fusion
-    if (sys_status[0] == 1 || sys_err[0] != 0) {
-      RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
-        "System error detected - Status: %d, Error: %d", sys_status[0], sys_err[0]);
-    }
+    if (read_register(BNO055_SYS_STAT_ADDR, sys_status, 1) &&
+        read_register(BNO055_SYS_ERR_ADDR, sys_err, 1) &&
+        read_register(BNO055_SELFTEST_RESULT_ADDR, self_test, 1))
+    {
+      // System status: 0=idle, 1=sys error, 2=init peripheral, 3=init system,
+      //                4=executing, 5=running, 6=running without fusion
+      if (sys_status[0] == 1 || sys_err[0] != 0) {
+        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+          "System error detected - Status: %d, Error: %d", sys_status[0], sys_err[0]);
+      }
     
-    // Self test result: bit 0=accelerometer, 1=magnetometer, 2=gyroscope, 3=MCU
-    if (self_test[0] != SELFTEST_ALL_PASSED) {
-      RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 10000,
-        "Self-test failed: 0x%02X (expected 0x%02X)", self_test[0], SELFTEST_ALL_PASSED);
+      // Self test result: bit 0=accelerometer, 1=magnetometer, 2=gyroscope, 3=MCU
+      if (self_test[0] != SELFTEST_ALL_PASSED) {
+        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 10000,
+          "Self-test failed: 0x%02X (expected 0x%02X)", self_test[0], SELFTEST_ALL_PASSED);
+      }
     }
   }
 

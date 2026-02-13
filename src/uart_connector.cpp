@@ -109,15 +109,48 @@ bool UARTConnector::connect()
     return false;
   }
 
-  // Verify connection by reading chip ID
-  std::vector<uint8_t> chip_id;
-  if (!read(BNO055_CHIP_ID_ADDR, chip_id, 1)) {
-    close(fd_);
-    fd_ = -1;
-    return false;
+  // Flush any stale data from previous session or partial BNO055 responses
+  tcflush(fd_, TCIOFLUSH);
+
+  // Send a blind hardware reset to BNO055 in case the sensor is in a
+  // confused UART state (e.g. after cable intermittent contact).
+  // Even if this write fails or BNO055 doesn't ACK, the reset trigger
+  // bit may reach the sensor and bring it to a known state.
+  {
+    // Set page 0 first (BNO055_PAGE_ID_ADDR=0x07, value=0x00)
+    uint8_t page_cmd[] = {COM_START_BYTE_WR, COM_WRITE, BNO055_PAGE_ID_ADDR, 0x01, 0x00};
+    ::write(fd_, page_cmd, sizeof(page_cmd));
+    usleep(10000);  // 10ms
+    // Drain any response (don't care if it fails)
+    uint8_t drain[8];
+    ::read(fd_, drain, sizeof(drain));
+
+    // Send reset trigger (BNO055_SYS_TRIGGER_ADDR=0x3F, value=0x20)
+    uint8_t reset_cmd[] = {COM_START_BYTE_WR, COM_WRITE, BNO055_SYS_TRIGGER_ADDR, 0x01, 0x20};
+    ::write(fd_, reset_cmd, sizeof(reset_cmd));
+    // BNO055 needs ~650ms to boot after reset
+    usleep(800000);  // 800ms
+    // Flush everything after reset
+    tcflush(fd_, TCIOFLUSH);
   }
 
-  if (chip_id[0] != BNO055_ID) {
+  // Verify connection by reading chip ID with retries
+  // After cable reconnect + hardware reset, BNO055 may need a few attempts
+  std::vector<uint8_t> chip_id;
+  bool chip_id_ok = false;
+  for (int attempt = 0; attempt < 5; attempt++) {
+    if (attempt > 0) {
+      usleep(200000);  // 200ms between retries
+      tcflush(fd_, TCIOFLUSH);
+    }
+    chip_id.clear();
+    if (read(BNO055_CHIP_ID_ADDR, chip_id, 1) && chip_id.size() == 1 && chip_id[0] == BNO055_ID) {
+      chip_id_ok = true;
+      break;
+    }
+  }
+
+  if (!chip_id_ok) {
     close(fd_);
     fd_ = -1;
     return false;
@@ -143,14 +176,31 @@ void UARTConnector::flush_buffers()
 
 bool UARTConnector::reset()
 {
-  // Close existing connection
-  disconnect();
-  
-  // Small delay before reconnect
-  usleep(100000);  // 100ms
-  
-  // Reconnect
-  return connect();
+  // Multi-attempt reset with increasing delays.
+  // When the cable between UART converter and BNO055 had intermittent contact,
+  // the BNO055 UART state machine may be confused. We need:
+  // 1) Close and reopen the serial port (clears kernel buffers)
+  // 2) Send hardware reset to BNO055 (done inside connect())
+  // 3) Retry multiple times with increasing delays
+  const int max_reset_attempts = 3;
+  const int base_delay_ms = 200;
+
+  for (int attempt = 0; attempt < max_reset_attempts; attempt++) {
+    disconnect();
+
+    // Increasing delay: 200ms, 500ms, 1000ms
+    int delay_ms = base_delay_ms * (attempt + 1);
+    if (attempt > 0) {
+      delay_ms += 300 * attempt;  // Extra time for BNO055 to settle
+    }
+    usleep(delay_ms * 1000);
+
+    if (connect()) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 int UARTConnector::read_response(std::vector<uint8_t> & data, size_t expected_length)
