@@ -46,6 +46,8 @@ public:
   bool read(uint8_t reg_addr, std::vector<uint8_t> & data, size_t length) override;
   bool write(uint8_t reg_addr, const std::vector<uint8_t> & data) override;
   bool is_connected() const override { return fd_ >= 0; }
+  void flush_buffers() override;
+  bool reset() override;
 
 private:
   std::string port_;
@@ -53,7 +55,8 @@ private:
   double timeout_;
   int fd_;
   
-  bool read_response(std::vector<uint8_t> & data, size_t expected_length);
+  // Returns: 0 = success, >0 = BNO055 error code, -1 = comm failure
+  int read_response(std::vector<uint8_t> & data, size_t expected_length);
 };
 
 }  // namespace bno055

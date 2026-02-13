@@ -98,8 +98,18 @@ private:
   double gyr_factor_;
   double grav_factor_;
 
+  // IMU anomaly detection parameters
+  double imu_change_epsilon_;
+  int imu_constant_threshold_;
+  int imu_history_size_;
+  double max_std_dev_threshold_;
+
+  // Recovery parameters
+  double imu_ok_timeout_;
+  double serial_reset_timeout_;
+
   // Hardware connector
-  std::unique_ptr<Connector> connector_;
+  std::shared_ptr<Connector> connector_;
   
   // Sensor service
   std::unique_ptr<SensorService> sensor_service_;

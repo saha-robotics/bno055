@@ -46,6 +46,8 @@ public:
   virtual bool read(uint8_t reg_addr, std::vector<uint8_t> & data, size_t length) = 0;
   virtual bool write(uint8_t reg_addr, const std::vector<uint8_t> & data) = 0;
   virtual bool is_connected() const = 0;
+  virtual void flush_buffers() {}
+  virtual bool reset() { return false; }
 };
 
 }  // namespace bno055

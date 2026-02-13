@@ -210,6 +210,10 @@ constexpr std::array<double, 3> DEFAULT_VARIANCE_ANGULAR_VEL = {0.04, 0.04, 0.04
 constexpr std::array<double, 3> DEFAULT_VARIANCE_ORIENTATION = {0.0159, 0.0159, 0.0159};
 constexpr std::array<double, 3> DEFAULT_VARIANCE_MAG = {0.0, 0.0, 0.0};
 
+// Self-test and calibration constants
+constexpr uint8_t SELFTEST_ALL_PASSED = 0x0F;
+constexpr uint8_t CALIBRATION_FULLY_CALIBRATED = 3;
+
 }  // namespace bno055
 
 #endif  // BNO055__REGISTERS_HPP_

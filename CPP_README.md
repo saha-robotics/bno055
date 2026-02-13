@@ -36,7 +36,13 @@ source install/setup.bash
 The lifecycle node allows controlled state transitions:
 
 ```bash
-# Launch with automatic configuration and activation
+# Launch with UART connection (default) - auto configures and activates
+ros2 launch bno055 bno055.launch.py
+
+# Launch with I2C connection - auto configures and activates
+ros2 launch bno055 bno055_i2c.launch.py
+
+# Launch with explicit lifecycle management
 ros2 launch bno055 bno055_lifecycle.launch.py
 
 # Or manually control lifecycle transitions

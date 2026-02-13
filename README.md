@@ -130,15 +130,29 @@ Run the `bno055` ROS2 node with default parameters:
     # source your local workspace (overlay) in addition to the ROS2 sourcing (underlay):
     source ~/ros2_ws/install/setup.sh
     # run the node:
-    ros2 run bno055 bno055
+    ros2 run bno055 bno055_lifecycle_node
     
 Run with customized parameter file:
 
-    ros2 run bno055 bno055 --ros-args --params-file ./src/bno055/bno055/params/bno055_params.yaml
+    ros2 run bno055 bno055_lifecycle_node --ros-args --params-file ./src/bno055/bno055/params/bno055_params.yaml
     
-Run launch file:
+Run launch file (UART connection - default):
 
     ros2 launch bno055 bno055.launch.py
+
+Run launch file (I2C connection):
+
+    ros2 launch bno055 bno055_i2c.launch.py
+
+Run launch file with manual lifecycle control:
+
+    ros2 launch bno055 bno055_lifecycle.launch.py
+
+The lifecycle launch files automatically configure and activate the node.
+For manual lifecycle control, you can use:
+
+    ros2 lifecycle set /bno055 configure
+    ros2 lifecycle set /bno055 activate
     
 
 ### Performing flake8 Linting

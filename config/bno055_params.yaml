@@ -25,44 +25,42 @@
 # CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
- 
-import os
-from ament_index_python.packages import get_package_share_directory
-from launch import LaunchDescription
-from launch_ros.actions import LifecycleNode, Node
 
-def generate_launch_description():
-    ld = LaunchDescription()
-    config = os.path.join(
-        get_package_share_directory('bno055'),
-        'config',
-        'bno055_params.yaml'
-        )
-        
-    # Create lifecycle node
-    lifecycle_node = LifecycleNode(
-        package='bno055',
-        executable='bno055_lifecycle_node',
-        name='bno055',
-        namespace='',
-        parameters=[config],
-        output='screen'
-    )
+/**:
+  ros__parameters:
+    ros_topic_prefix: "bno055/"
+    connection_type: "uart"
+    uart_port: "/dev/bno055"
+    uart_baudrate: 115200
+    uart_timeout: 0.5
+    data_query_frequency: 50
+    calib_status_frequency: 0.1
+    frame_id: "bno055_link"
+    operation_mode: 0x0C
+    placement_axis_remap: "P1"
+    acc_factor: 100.0
+    mag_factor: 16000000.0
+    gyr_factor: 900.0
+    grav_factor: 100.0
+    set_offsets: false # set to true to use offsets below
+    offset_acc: [0xFFEC, 0x00A5, 0xFFE8]
+    offset_mag: [0xFFB4, 0xFE9E, 0x027D]
+    offset_gyr: [0x0002, 0xFFFF, 0xFFFF]
+    imu_change_epsilon: 0.0001
+    imu_constant_threshold: 100
+    imu_history_size: 20
+    max_std_dev_threshold: 2.2
+    # IMU OK timeout: if no data received for this many seconds, set imu_ok to false
+    # Set to 0.0 to disable
+    imu_ok_timeout: 1.0
+    # Serial reset timeout: if no data received for this many seconds, reset serial connection and reconfigure
+    # Set to 0.0 to disable
+    serial_reset_timeout: 5.0
+    ## Sensor standard deviation [x,y,z]
+    ## Used to calculate covariance matrices
+    ## defaults are used if parameters below are not provided
+    # variance_acc: [0.0, 0.0, 0.0] # [m/s^2]
+    # variance_angular_vel: [0.0, 0.0, 0.0] # [rad/s]
+    # variance_orientation: [0.0, 0.0, 0.0] # [rad]
+    # variance_mag: [0.0, 0.0, 0.0] # [Tesla]
 
-    # Lifecycle manager to handle state transitions (configure -> activate)
-    lifecycle_manager = Node(
-        package='nav2_lifecycle_manager',
-        executable='lifecycle_manager',
-        name='bno055_lifecycle_manager',
-        output='screen',
-        parameters=[{
-            'autostart': True,
-            'node_names': ['bno055'],
-            'bond_timeout': 0.0,
-        }]
-    )
-
-    ld.add_action(lifecycle_node)
-    ld.add_action(lifecycle_manager)
-    
-    return ld

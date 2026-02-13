@@ -30,6 +30,8 @@
 #include "bno055/i2c_connector.hpp"
 #include "bno055/uart_connector.hpp"
 #include "bno055/registers.hpp"
+#include <thread>
+#include <chrono>
 
 namespace bno055
 {
@@ -56,7 +58,7 @@ void BNO055LifecycleNode::declare_parameters()
   // General parameters
   declare_parameter("frame_id", "bno055");
   declare_parameter("ros_topic_prefix", "bno055/");
-  declare_parameter("data_query_frequency", 10.0);
+  declare_parameter("data_query_frequency", 10);
   declare_parameter("calib_status_frequency", 0.1);
 
   // Sensor configuration
@@ -82,6 +84,16 @@ void BNO055LifecycleNode::declare_parameters()
   declare_parameter("variance_angular_vel", std::vector<double>{0.04, 0.04, 0.04});
   declare_parameter("variance_orientation", std::vector<double>{0.0159, 0.0159, 0.0159});
   declare_parameter("variance_mag", std::vector<double>{0.0, 0.0, 0.0});
+
+  // IMU anomaly detection parameters
+  declare_parameter("imu_change_epsilon", 0.0001);
+  declare_parameter("imu_constant_threshold", 100);
+  declare_parameter("imu_history_size", 20);
+  declare_parameter("max_std_dev_threshold", 2.2);
+
+  // Recovery parameters
+  declare_parameter("imu_ok_timeout", 1.0);
+  declare_parameter("serial_reset_timeout", 5.0);
 }
 
 bool BNO055LifecycleNode::load_parameters()
@@ -95,7 +107,7 @@ bool BNO055LifecycleNode::load_parameters()
     uart_timeout_ = get_parameter("uart_timeout").as_double();
     frame_id_ = get_parameter("frame_id").as_string();
     ros_topic_prefix_ = get_parameter("ros_topic_prefix").as_string();
-    data_query_frequency_ = get_parameter("data_query_frequency").as_double();
+    data_query_frequency_ = static_cast<double>(get_parameter("data_query_frequency").as_int());
     calib_status_frequency_ = get_parameter("calib_status_frequency").as_double();
     operation_mode_ = static_cast<uint8_t>(get_parameter("operation_mode").as_int());
     placement_axis_remap_ = get_parameter("placement_axis_remap").as_string();
@@ -127,6 +139,16 @@ bool BNO055LifecycleNode::load_parameters()
     variance_angular_vel_ = get_parameter("variance_angular_vel").as_double_array();
     variance_orientation_ = get_parameter("variance_orientation").as_double_array();
     variance_mag_ = get_parameter("variance_mag").as_double_array();
+
+    // Load IMU anomaly detection parameters
+    imu_change_epsilon_ = get_parameter("imu_change_epsilon").as_double();
+    imu_constant_threshold_ = get_parameter("imu_constant_threshold").as_int();
+    imu_history_size_ = get_parameter("imu_history_size").as_int();
+    max_std_dev_threshold_ = get_parameter("max_std_dev_threshold").as_double();
+
+    // Load recovery parameters
+    imu_ok_timeout_ = get_parameter("imu_ok_timeout").as_double();
+    serial_reset_timeout_ = get_parameter("serial_reset_timeout").as_double();
 
     RCLCPP_INFO(get_logger(), "Parameters loaded successfully");
     RCLCPP_INFO(get_logger(), "  connection_type: %s", connection_type_.c_str());
@@ -191,6 +213,17 @@ bool BNO055LifecycleNode::configure_sensor()
   config.variance_mag = variance_mag_;
   config.topic_prefix = ros_topic_prefix_;
 
+  // IMU anomaly detection config
+  config.imu_change_epsilon = imu_change_epsilon_;
+  config.imu_constant_threshold = imu_constant_threshold_;
+  config.imu_history_size = static_cast<size_t>(imu_history_size_);
+  config.max_std_dev_threshold = max_std_dev_threshold_;
+
+  // Recovery config
+  config.imu_ok_timeout = imu_ok_timeout_;
+  config.serial_reset_timeout = serial_reset_timeout_;
+  config.data_query_frequency = data_query_frequency_;
+
   sensor_service_ = std::make_unique<SensorService>(
     shared_from_this(), connector_, config);
 
@@ -213,20 +246,43 @@ CallbackReturn BNO055LifecycleNode::on_configure(const rclcpp_lifecycle::State &
     return CallbackReturn::FAILURE;
   }
 
-  // Create hardware connector
-  if (!create_connector()) {
-    RCLCPP_ERROR(get_logger(), "Failed to create connector");
-    return CallbackReturn::FAILURE;
+  // Retry loop for hardware connection + sensor configuration
+  // USB bus contention with other devices (RealSense, LiDAR) can cause
+  // transient UART failures during concurrent startup
+  const int max_retries = 5;
+  for (int attempt = 1; attempt <= max_retries; attempt++) {
+    if (attempt > 1) {
+      RCLCPP_WARN(get_logger(), "Configuration retry %d/%d...", attempt, max_retries);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    }
+
+    // Create hardware connector
+    if (!create_connector()) {
+      RCLCPP_WARN(get_logger(), "Failed to create connector (attempt %d/%d)", attempt, max_retries);
+      if (connector_) {
+        connector_->disconnect();
+        connector_.reset();
+      }
+      continue;
+    }
+
+    // Configure sensor
+    if (!configure_sensor()) {
+      RCLCPP_WARN(get_logger(), "Failed to configure sensor (attempt %d/%d)", attempt, max_retries);
+      if (connector_) {
+        connector_->disconnect();
+        connector_.reset();
+      }
+      sensor_service_.reset();
+      continue;
+    }
+
+    RCLCPP_INFO(get_logger(), "Configuration complete");
+    return CallbackReturn::SUCCESS;
   }
 
-  // Configure sensor
-  if (!configure_sensor()) {
-    RCLCPP_ERROR(get_logger(), "Failed to configure sensor");
-    return CallbackReturn::FAILURE;
-  }
-
-  RCLCPP_INFO(get_logger(), "Configuration complete");
-  return CallbackReturn::SUCCESS;
+  RCLCPP_ERROR(get_logger(), "Failed to configure after %d attempts", max_retries);
+  return CallbackReturn::FAILURE;
 }
 
 CallbackReturn BNO055LifecycleNode::on_activate(const rclcpp_lifecycle::State & previous_state)
@@ -257,9 +313,10 @@ CallbackReturn BNO055LifecycleNode::on_activate(const rclcpp_lifecycle::State & 
     RCLCPP_INFO(get_logger(), "Calibration timer started at %.1f Hz", calib_status_frequency_);
   }
 
-  // Create and start watchdog timer (runs every 0.5 seconds)
+  // Create and start watchdog timer (runs every 5 seconds)
+  // Keep low frequency to minimize UART bus contention with data reads
   watchdog_timer_ = create_wall_timer(
-    std::chrono::milliseconds(500),
+    std::chrono::milliseconds(5000),
     std::bind(&BNO055LifecycleNode::watchdog_check_callback, this));
   RCLCPP_INFO(get_logger(), "Watchdog timer started");
 
