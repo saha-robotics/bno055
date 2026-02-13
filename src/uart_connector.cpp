@@ -134,34 +134,82 @@ void UARTConnector::disconnect()
   }
 }
 
-bool UARTConnector::read_response(std::vector<uint8_t> & data, size_t expected_length)
+void UARTConnector::flush_buffers()
 {
-  // Read response header (2 bytes: start byte + length)
-  std::vector<uint8_t> header(2);
-  if (::read(fd_, header.data(), 2) != 2) {
-    return false;
+  if (fd_ >= 0) {
+    tcflush(fd_, TCIOFLUSH);
+  }
+}
+
+bool UARTConnector::reset()
+{
+  // Close existing connection
+  disconnect();
+  
+  // Small delay before reconnect
+  usleep(100000);  // 100ms
+  
+  // Reconnect
+  return connect();
+}
+
+int UARTConnector::read_response(std::vector<uint8_t> & data, size_t expected_length)
+{
+  // Read all available bytes: BNO055 read response = [0xBB, len, data...]
+  // BNO055 error response = [0xEE, error_code]
+  // Returns: 0 = success, >0 = BNO055 error code, -1 = comm failure
+  uint8_t byte;
+  int max_attempts = 10;
+  
+  // Search for a valid response header byte (0xBB or 0xEE)
+  for (int i = 0; i < max_attempts; i++) {
+    if (::read(fd_, &byte, 1) != 1) {
+      return -1;
+    }
+    if (byte == COM_START_BYTE_RESP || byte == COM_START_BYTE_ERROR_RESP) {
+      break;
+    }
+    if (i == max_attempts - 1) {
+      return -1;
+    }
   }
 
-  if (header[0] == COM_START_BYTE_ERROR_RESP) {
-    return false;
+  if (byte == COM_START_BYTE_ERROR_RESP) {
+    // Read the error code byte
+    uint8_t err = 0;
+    ::read(fd_, &err, 1);
+    return static_cast<int>(err);  // Return BNO055 error code (0x07 = bus overrun, etc.)
   }
 
-  if (header[0] != COM_START_BYTE_RESP) {
-    return false;
+  if (byte != COM_START_BYTE_RESP) {
+    return -1;
   }
 
-  uint8_t response_length = header[1];
+  // Read length byte
+  uint8_t response_length;
+  if (::read(fd_, &response_length, 1) != 1) {
+    return -1;
+  }
+
   if (response_length != expected_length) {
-    return false;
+    // Drain remaining bytes
+    std::vector<uint8_t> drain(response_length);
+    ::read(fd_, drain.data(), response_length);
+    return -1;
   }
 
   // Read data
   data.resize(expected_length);
-  if (::read(fd_, data.data(), expected_length) != static_cast<ssize_t>(expected_length)) {
-    return false;
+  size_t total_read = 0;
+  while (total_read < expected_length) {
+    ssize_t n = ::read(fd_, data.data() + total_read, expected_length - total_read);
+    if (n <= 0) {
+      return -1;
+    }
+    total_read += static_cast<size_t>(n);
   }
 
-  return true;
+  return 0;  // Success
 }
 
 bool UARTConnector::read(uint8_t reg_addr, std::vector<uint8_t> & data, size_t length)
@@ -170,14 +218,35 @@ bool UARTConnector::read(uint8_t reg_addr, std::vector<uint8_t> & data, size_t l
     return false;
   }
 
-  // Build read command: [start_byte, read_cmd, reg_addr, length]
-  std::vector<uint8_t> cmd = {COM_START_BYTE_WR, COM_READ, reg_addr, static_cast<uint8_t>(length)};
-  
-  if (::write(fd_, cmd.data(), cmd.size()) != static_cast<ssize_t>(cmd.size())) {
-    return false;
-  }
+  // Retry loop: BNO055 can return 0x07 (BUS_OVER_RUN_ERROR) under high-frequency reads
+  const int max_retries = 3;
+  for (int attempt = 0; attempt < max_retries; attempt++) {
+    if (attempt > 0) {
+      // Wait before retry — give sensor time to recover from bus overrun
+      usleep(2000);  // 2ms
+    }
 
-  return read_response(data, length);
+    // Flush input buffer before sending command to discard stale data
+    tcflush(fd_, TCIFLUSH);
+
+    // Build read command: [start_byte, read_cmd, reg_addr, length]
+    std::vector<uint8_t> cmd = {COM_START_BYTE_WR, COM_READ, reg_addr, static_cast<uint8_t>(length)};
+    
+    if (::write(fd_, cmd.data(), cmd.size()) != static_cast<ssize_t>(cmd.size())) {
+      continue;
+    }
+
+    int result = read_response(data, length);
+    if (result == 0) {
+      return true;  // Success
+    }
+    // Error 0x07 = BUS_OVER_RUN_ERROR — transient, worth retrying
+    // Error 0x0A = RECEIVE_CHARACTER_TIMEOUT — also transient
+    if (result != 0x07 && result != 0x0A) {
+      return false;  // Non-transient error, don't retry
+    }
+  }
+  return false;
 }
 
 bool UARTConnector::write(uint8_t reg_addr, const std::vector<uint8_t> & data)
@@ -185,6 +254,9 @@ bool UARTConnector::write(uint8_t reg_addr, const std::vector<uint8_t> & data)
   if (fd_ < 0) {
     return false;
   }
+
+  // Flush input buffer before sending command to discard stale data
+  tcflush(fd_, TCIFLUSH);
 
   // Build write command: [start_byte, write_cmd, reg_addr, length, data...]
   std::vector<uint8_t> cmd;
@@ -198,9 +270,14 @@ bool UARTConnector::write(uint8_t reg_addr, const std::vector<uint8_t> & data)
     return false;
   }
 
-  // Read write response (1 byte status)
-  std::vector<uint8_t> response;
-  return read_response(response, 1);
+  // BNO055 write response is always 2 bytes: [0xEE, status]
+  // Status 0x01 = success, anything else = error
+  uint8_t response[2];
+  ssize_t n = ::read(fd_, response, 2);
+  if (n != 2) {
+    return false;
+  }
+  return (response[0] == COM_START_BYTE_ERROR_RESP && response[1] == 0x01);
 }
 
 }  // namespace bno055

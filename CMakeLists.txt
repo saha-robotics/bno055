@@ -69,6 +69,11 @@ install(DIRECTORY bno055/params/
   FILES_MATCHING PATTERN "*.yaml"
 )
 
+install(DIRECTORY config/
+  DESTINATION share/${PROJECT_NAME}/config
+  FILES_MATCHING PATTERN "*.yaml"
+)
+
 # Install resource files
 install(DIRECTORY resource/
   DESTINATION share/${PROJECT_NAME}/resource

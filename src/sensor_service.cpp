@@ -34,6 +34,7 @@
 #include <iomanip>
 #include <thread>
 #include <chrono>
+#include <algorithm>
 
 namespace bno055
 {
@@ -70,6 +71,12 @@ SensorService::SensorService(
     config_.topic_prefix + "calibration_request",
     std::bind(&SensorService::calibration_request_callback, this,
       std::placeholders::_1, std::placeholders::_2));
+
+  // Create imu_ok publisher with latching QoS (transient_local)
+  rclcpp::QoS latching_qos(rclcpp::KeepLast(1));
+  latching_qos.transient_local();
+  pub_imu_ok_ = node_->create_publisher<std_msgs::msg::Bool>(
+    config_.topic_prefix + "imu_ok", latching_qos);
 }
 
 bool SensorService::configure()
@@ -82,22 +89,46 @@ bool SensorService::configure()
   write_register(BNO055_PAGE_ID_ADDR, page_zero);
   std::vector<uint8_t> reset_trigger = {0x20};
   write_register(BNO055_SYS_TRIGGER_ADDR, reset_trigger);
-  std::this_thread::sleep_for(std::chrono::milliseconds(650));
+  // BNO055 needs ~650ms to boot after reset, but USB bus contention
+  // can delay responses significantly — use generous wait time
+  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+  // Flush stale data from UART buffers after sensor reset
+  if (connector_) {
+    connector_->flush_buffers();
+  }
 
-  // Verify chip ID
+  // Verify chip ID (with retries - sensor may be slow after reset)
   std::vector<uint8_t> chip_id;
-  if (!read_register(BNO055_CHIP_ID_ADDR, chip_id, 1)) {
-    RCLCPP_ERROR(node_->get_logger(), "Failed to read chip ID");
+  bool chip_id_ok = false;
+  for (int attempt = 0; attempt < 5; attempt++) {
+    if (attempt > 0) {
+      RCLCPP_WARN(node_->get_logger(), "Chip ID read retry %d/5...", attempt + 1);
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    chip_id.clear();
+    if (read_register(BNO055_CHIP_ID_ADDR, chip_id, 1) && chip_id[0] == BNO055_ID) {
+      chip_id_ok = true;
+      break;
+    }
+  }
+  if (!chip_id_ok) {
+    RCLCPP_ERROR(node_->get_logger(), "Failed to read correct chip ID after retries");
     return false;
   }
 
-  if (chip_id[0] != BNO055_ID) {
-    RCLCPP_ERROR(node_->get_logger(), "Device ID=%02x is incorrect", chip_id[0]);
-    return false;
+  // Set to config mode (with retries - USB bus contention can cause transient failures)
+  bool config_mode_ok = false;
+  for (int attempt = 0; attempt < 5; attempt++) {
+    if (attempt > 0) {
+      RCLCPP_WARN(node_->get_logger(), "Config mode retry %d/5...", attempt + 1);
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    if (set_mode(OPERATION_MODE_CONFIG)) {
+      config_mode_ok = true;
+      break;
+    }
   }
-
-  // Set to config mode
-  if (!set_mode(OPERATION_MODE_CONFIG)) {
+  if (!config_mode_ok) {
     RCLCPP_WARN(node_->get_logger(), "Unable to set IMU into config mode");
     return false;
   }
@@ -217,6 +248,7 @@ void SensorService::activate_publishers()
   pub_euler_->on_activate();
   pub_temp_->on_activate();
   pub_calib_status_->on_activate();
+  pub_imu_ok_->on_activate();
 }
 
 void SensorService::deactivate_publishers()
@@ -228,6 +260,7 @@ void SensorService::deactivate_publishers()
   pub_euler_->on_deactivate();
   pub_temp_->on_deactivate();
   pub_calib_status_->on_deactivate();
+  pub_imu_ok_->on_deactivate();
 }
 
 void SensorService::get_sensor_data()
@@ -346,6 +379,9 @@ void SensorService::get_sensor_data()
   euler_msg.y = bytes_to_int16(buf, 20) / 16.0;  // roll (degrees)
   euler_msg.z = bytes_to_int16(buf, 22) / 16.0;  // pitch (degrees)
   pub_euler_->publish(euler_msg);
+
+  // IMU anomaly detection (matching Python implementation)
+  check_imu_anomalies(imu_msg);
 }
 
 void SensorService::get_calib_status()
@@ -382,8 +418,66 @@ void SensorService::get_calib_status()
 void SensorService::check_watchdog()
 {
   auto now = std::chrono::steady_clock::now();
-  auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+  double elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
     now - last_successful_read_).count() / 1000.0;
+
+  // Check imu_ok timeout - set imu_ok to false if no data for too long
+  if (config_.imu_ok_timeout > 0.0 && elapsed >= config_.imu_ok_timeout) {
+    if (imu_ok_) {
+      set_imu_ok(false);
+      std::stringstream ss;
+      ss << "[Watchdog] IMU data timeout: No data received for " << std::fixed
+         << std::setprecision(2) << elapsed << " seconds (threshold: "
+         << config_.imu_ok_timeout << "s). Setting imu_ok to false.";
+      log_throttled("watchdog_imu_ok_timeout", ss.str(), 1, 5.0);
+    }
+  }
+
+  // Check serial reset timeout - reset connection and reconfigure sensor
+  if (config_.serial_reset_timeout > 0.0 && elapsed >= config_.serial_reset_timeout
+      && !reset_in_progress_)
+  {
+    reset_in_progress_ = true;
+
+    try {
+      std::stringstream ss;
+      ss << "[Watchdog] Serial timeout detected: No data for " << std::fixed
+         << std::setprecision(2) << elapsed << "s (threshold: "
+         << config_.serial_reset_timeout << "s). Resetting serial connection...";
+      log_throttled("watchdog_serial_reset", ss.str(), 2, 10.0);
+
+      // Reset the connector (close + reopen)
+      if (connector_ && connector_->reset()) {
+        // Reconfigure the sensor after reset
+        if (configure()) {
+          last_successful_read_ = std::chrono::steady_clock::now();
+          consecutive_error_count_ = 0;
+          // Clear anomaly detection state after recovery
+          imu_constant_count_ = 0;
+          has_prev_imu_data_ = false;
+          accel_x_history_.clear();
+          accel_y_history_.clear();
+          accel_z_history_.clear();
+          log_throttled("watchdog_reset_success",
+            "Sensor reconfigured successfully after watchdog reset", 0, 10.0);
+        } else {
+          set_imu_ok(false);
+          log_throttled("watchdog_reconfig_fail",
+            "Failed to reconfigure sensor after watchdog reset", 2, 10.0);
+        }
+      } else {
+        set_imu_ok(false);
+        log_throttled("watchdog_reset_fail",
+          "Failed to reset serial connection", 2, 10.0);
+      }
+    } catch (const std::exception & e) {
+      set_imu_ok(false);
+      log_throttled("watchdog_reset_exception",
+        std::string("Exception during watchdog reset: ") + e.what(), 2, 10.0);
+    }
+
+    reset_in_progress_ = false;
+  }
 
   // Check for connection issues based on system status and self test
   std::vector<uint8_t> sys_status, sys_err, self_test;
@@ -410,6 +504,147 @@ void SensorService::check_watchdog()
   if (elapsed > 2.0) {
     RCLCPP_ERROR_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
       "No data received for %.2f seconds - possible connection loss", elapsed);
+  }
+}
+
+void SensorService::check_imu_anomalies(const sensor_msgs::msg::Imu & imu_msg)
+{
+  if (has_prev_imu_data_) {
+    // Check if IMU data is constant (sensor stuck)
+    bool is_constant = (
+      std::abs(imu_msg.linear_acceleration.x - prev_accel_x_) < config_.imu_change_epsilon &&
+      std::abs(imu_msg.linear_acceleration.y - prev_accel_y_) < config_.imu_change_epsilon &&
+      std::abs(imu_msg.linear_acceleration.z - prev_accel_z_) < config_.imu_change_epsilon &&
+      std::abs(imu_msg.angular_velocity.x - prev_gyro_x_) < config_.imu_change_epsilon &&
+      std::abs(imu_msg.angular_velocity.y - prev_gyro_y_) < config_.imu_change_epsilon &&
+      std::abs(imu_msg.angular_velocity.z - prev_gyro_z_) < config_.imu_change_epsilon);
+
+    if (is_constant) {
+      imu_constant_count_++;
+      if (imu_constant_count_ >= config_.imu_constant_threshold) {
+        double duration_sec = imu_constant_count_ / config_.data_query_frequency;
+        std::stringstream ss;
+        ss << "IMU anomaly detected: Data constant for " << std::fixed << std::setprecision(2)
+           << duration_sec << " seconds"
+           << " (accel: " << imu_msg.linear_acceleration.x
+           << ", " << imu_msg.linear_acceleration.y
+           << ", " << imu_msg.linear_acceleration.z
+           << " | gyro: " << imu_msg.angular_velocity.x
+           << ", " << imu_msg.angular_velocity.y
+           << ", " << imu_msg.angular_velocity.z << ")";
+        log_throttled("imu_constant", ss.str(), 1, 5.0);
+        set_imu_ok(false);
+      }
+    } else {
+      imu_constant_count_ = 0;
+      set_imu_ok(true);
+    }
+  }
+
+  // Check for abnormal acceleration values using standard deviation
+  accel_x_history_.push_back(imu_msg.linear_acceleration.x);
+  accel_y_history_.push_back(imu_msg.linear_acceleration.y);
+  accel_z_history_.push_back(imu_msg.linear_acceleration.z);
+
+  if (accel_x_history_.size() > config_.imu_history_size) {
+    accel_x_history_.erase(accel_x_history_.begin());
+    accel_y_history_.erase(accel_y_history_.begin());
+    accel_z_history_.erase(accel_z_history_.begin());
+  }
+
+  if (accel_x_history_.size() >= config_.imu_history_size / 2) {
+    size_t n = accel_x_history_.size();
+    double mean_x = 0.0, mean_y = 0.0, mean_z = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      mean_x += accel_x_history_[i];
+      mean_y += accel_y_history_[i];
+      mean_z += accel_z_history_[i];
+    }
+    mean_x /= n;
+    mean_y /= n;
+    mean_z /= n;
+
+    double var_x = 0.0, var_y = 0.0, var_z = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      var_x += std::pow(accel_x_history_[i] - mean_x, 2);
+      var_y += std::pow(accel_y_history_[i] - mean_y, 2);
+      var_z += std::pow(accel_z_history_[i] - mean_z, 2);
+    }
+    var_x /= n;
+    var_y /= n;
+    var_z /= n;
+
+    double std_x = std::sqrt(var_x);
+    double std_y = std::sqrt(var_y);
+    double std_z = std::sqrt(var_z);
+
+    if (std_x > config_.max_std_dev_threshold ||
+        std_y > config_.max_std_dev_threshold ||
+        std_z > config_.max_std_dev_threshold)
+    {
+      std::stringstream ss;
+      ss << "IMU anomaly detected: Standard deviation too high (noisy/broken data). "
+         << "Std Dev: (" << std::fixed << std::setprecision(4)
+         << std_x << ", " << std_y << ", " << std_z
+         << ") | Threshold: " << std::setprecision(2) << config_.max_std_dev_threshold
+         << " m/s² | Mean: (" << std::setprecision(3)
+         << mean_x << ", " << mean_y << ", " << mean_z << ")";
+      log_throttled("imu_std_dev", ss.str(), 1, 5.0);
+      set_imu_ok(false);
+    }
+  }
+
+  // Update previous values
+  prev_accel_x_ = imu_msg.linear_acceleration.x;
+  prev_accel_y_ = imu_msg.linear_acceleration.y;
+  prev_accel_z_ = imu_msg.linear_acceleration.z;
+  prev_gyro_x_ = imu_msg.angular_velocity.x;
+  prev_gyro_y_ = imu_msg.angular_velocity.y;
+  prev_gyro_z_ = imu_msg.angular_velocity.z;
+  has_prev_imu_data_ = true;
+}
+
+void SensorService::set_imu_ok(bool value)
+{
+  if (imu_ok_ != value) {
+    imu_ok_ = value;
+    auto msg = std_msgs::msg::Bool();
+    msg.data = value;
+    pub_imu_ok_->publish(msg);
+    prev_imu_ok_ = value;
+
+    if (value) {
+      RCLCPP_INFO(node_->get_logger(), "IMU status recovered: imu_ok = true");
+    } else {
+      RCLCPP_WARN(node_->get_logger(), "IMU status degraded: imu_ok = false");
+    }
+  }
+}
+
+void SensorService::log_throttled(
+  const std::string & key, const std::string & msg, int level, double timeout_sec)
+{
+  auto now = std::chrono::steady_clock::now();
+  auto it = log_throttle_map_.find(key);
+
+  if (it == log_throttle_map_.end() ||
+      std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second).count() / 1000.0 >= timeout_sec)
+  {
+    switch (level) {
+      case 0:  // INFO
+        RCLCPP_INFO(node_->get_logger(), "%s", msg.c_str());
+        break;
+      case 1:  // WARN
+        RCLCPP_WARN(node_->get_logger(), "%s", msg.c_str());
+        break;
+      case 2:  // ERROR
+        RCLCPP_ERROR(node_->get_logger(), "%s", msg.c_str());
+        break;
+      default:
+        RCLCPP_INFO(node_->get_logger(), "%s", msg.c_str());
+        break;
+    }
+    log_throttle_map_[key] = now;
   }
 }
 

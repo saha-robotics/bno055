@@ -33,6 +33,7 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include <map>
 
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
 #include "rclcpp_lifecycle/lifecycle_publisher.hpp"
@@ -41,6 +42,7 @@
 #include "sensor_msgs/msg/temperature.hpp"
 #include "geometry_msgs/msg/vector3.hpp"
 #include "std_msgs/msg/string.hpp"
+#include "std_msgs/msg/bool.hpp"
 #include "example_interfaces/srv/trigger.hpp"
 
 #include "bno055/connector.hpp"
@@ -68,6 +70,17 @@ struct SensorConfig
   std::vector<double> variance_orientation;
   std::vector<double> variance_mag;
   std::string topic_prefix;
+
+  // IMU anomaly detection parameters
+  double imu_change_epsilon{0.0001};
+  int imu_constant_threshold{100};
+  size_t imu_history_size{20};
+  double max_std_dev_threshold{2.2};
+
+  // Recovery parameters
+  double imu_ok_timeout{1.0};         // seconds - 0.0 to disable
+  double serial_reset_timeout{5.0};   // seconds - 0.0 to disable
+  double data_query_frequency{50.0};
 };
 
 class SensorService
@@ -102,6 +115,7 @@ private:
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::Vector3>> pub_euler_;
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::Temperature>> pub_temp_;
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::String>> pub_calib_status_;
+  std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::Bool>> pub_imu_ok_;
 
   // Service
   rclcpp::Service<example_interfaces::srv::Trigger>::SharedPtr calibration_service_;
@@ -109,6 +123,27 @@ private:
   // State tracking for connection monitoring
   std::chrono::steady_clock::time_point last_successful_read_;
   int consecutive_error_count_;
+
+  // IMU anomaly detection state
+  bool imu_ok_{true};
+  bool prev_imu_ok_{false};
+  double prev_accel_x_{0.0};
+  double prev_accel_y_{0.0};
+  double prev_accel_z_{0.0};
+  double prev_gyro_x_{0.0};
+  double prev_gyro_y_{0.0};
+  double prev_gyro_z_{0.0};
+  bool has_prev_imu_data_{false};
+  int imu_constant_count_{0};
+  std::vector<double> accel_x_history_;
+  std::vector<double> accel_y_history_;
+  std::vector<double> accel_z_history_;
+
+  // Recovery state
+  bool reset_in_progress_{false};
+
+  // Log throttle map
+  std::map<std::string, std::chrono::steady_clock::time_point> log_throttle_map_;
 
   // Helper methods
   bool set_mode(uint8_t mode);
@@ -120,6 +155,11 @@ private:
   void calibration_request_callback(
     const std::shared_ptr<example_interfaces::srv::Trigger::Request> request,
     std::shared_ptr<example_interfaces::srv::Trigger::Response> response);
+
+  // IMU anomaly detection and recovery
+  void check_imu_anomalies(const sensor_msgs::msg::Imu & imu_msg);
+  void set_imu_ok(bool value);
+  void log_throttled(const std::string & key, const std::string & msg, int level, double timeout_sec = 5.0);
 };
 
 }  // namespace bno055
