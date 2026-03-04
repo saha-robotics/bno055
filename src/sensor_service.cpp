@@ -249,6 +249,11 @@ void SensorService::activate_publishers()
   pub_temp_->on_activate();
   pub_calib_status_->on_activate();
   pub_imu_ok_->on_activate();
+
+  // Publish initial imu_ok state so subscribers receive a value immediately
+  auto msg = std_msgs::msg::Bool();
+  msg.data = imu_ok_;
+  pub_imu_ok_->publish(msg);
 }
 
 void SensorService::deactivate_publishers()
