@@ -25,7 +25,7 @@
 # CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
- 
+
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -41,10 +41,10 @@ def generate_launch_description():
     config = os.path.join(
         get_package_share_directory('bno055'),
         'config',
-        'bno055_params.yaml'
+        'bno055_params_i2c.yaml'
         )
 
-    # Create lifecycle node (C++ executable)
+    # Create lifecycle node (C++ executable) with I2C configuration
     lifecycle_node = LifecycleNode(
         package='bno055',
         executable='bno055_lifecycle_node',

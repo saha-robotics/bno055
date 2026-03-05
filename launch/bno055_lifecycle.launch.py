@@ -29,12 +29,7 @@
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch_ros.actions import LifecycleNode
-from launch.actions import EmitEvent, RegisterEventHandler
-from launch_ros.events.lifecycle import ChangeState
-from launch_ros.event_handlers import OnStateTransition
-from lifecycle_msgs.msg import Transition
-
+from launch_ros.actions import LifecycleNode, Node
 
 def generate_launch_description():
     ld = LaunchDescription()
@@ -43,8 +38,8 @@ def generate_launch_description():
         'config',
         'bno055_params.yaml'
         )
-
-    # Create lifecycle node (C++ executable)
+        
+    # Create lifecycle node
     lifecycle_node = LifecycleNode(
         package='bno055',
         executable='bno055_lifecycle_node',
@@ -54,33 +49,20 @@ def generate_launch_description():
         output='screen'
     )
 
-    # When the node reaches the 'inactive' state, automatically activate it
-    register_event_handler_for_inactive_to_active = RegisterEventHandler(
-        OnStateTransition(
-            target_lifecycle_node=lifecycle_node,
-            start_state='configuring',
-            goal_state='inactive',
-            entities=[
-                EmitEvent(
-                    event=ChangeState(
-                        lifecycle_node_matcher=lambda node: node.name == lifecycle_node.name,
-                        transition_id=Transition.TRANSITION_ACTIVATE,
-                    ),
-                ),
-            ],
-        )
-    )
-
-    # When the node is created, trigger configuration
-    emit_event_to_request_that_lifecycle_node_does_configure_transition = EmitEvent(
-        event=ChangeState(
-            lifecycle_node_matcher=lambda node: node.name == lifecycle_node.name,
-            transition_id=Transition.TRANSITION_CONFIGURE,
-        )
+    # Lifecycle manager to handle state transitions (configure -> activate)
+    lifecycle_manager = Node(
+        package='nav2_lifecycle_manager',
+        executable='lifecycle_manager',
+        name='bno055_lifecycle_manager',
+        output='screen',
+        parameters=[{
+            'autostart': True,
+            'node_names': ['bno055'],
+            'bond_timeout': 0.0,
+        }]
     )
 
     ld.add_action(lifecycle_node)
-    ld.add_action(register_event_handler_for_inactive_to_active)
-    ld.add_action(emit_event_to_request_that_lifecycle_node_does_configure_transition)
-
+    ld.add_action(lifecycle_manager)
+    
     return ld
