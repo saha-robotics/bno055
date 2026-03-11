@@ -298,9 +298,12 @@ void SensorService::deactivate_publishers()
 
 void SensorService::get_sensor_data()
 {
-  // Read 45 bytes starting from accelerometer data register
+  // Read 46 bytes starting from accelerometer data register
+  // 45 bytes = sensor data (accel through temp), +1 byte = CALIB_STAT (0x35)
+  // Reading calibration inline avoids a separate UART round-trip per cycle
+  // (matches h4r_bosch_bno055_uart's 46-byte bulk read)
   std::vector<uint8_t> buf;
-  if (!read_register(BNO055_ACCEL_DATA_X_LSB_ADDR, buf, 45)) {
+  if (!read_register(BNO055_ACCEL_DATA_X_LSB_ADDR, buf, 46)) {
     consecutive_error_count_++;
     RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
       "Failed to read sensor data (error count: %d)", consecutive_error_count_);
@@ -405,6 +408,31 @@ void SensorService::get_sensor_data()
   temp_msg.header.frame_id = config_.frame_id;
   temp_msg.temperature = static_cast<double>(buf[44]);
   pub_temp_->publish(temp_msg);
+
+  // Publish calibration status inline from buf[45] (CALIB_STAT register)
+  // This avoids a separate UART read transaction for calibration
+  {
+    uint8_t calib_byte = buf[45];
+    uint8_t sys = (calib_byte >> 6) & 0x03;
+    uint8_t gyro = (calib_byte >> 4) & 0x03;
+    uint8_t accel = (calib_byte >> 2) & 0x03;
+    uint8_t mag = calib_byte & 0x03;
+
+    bool fully_calibrated = is_fully_calibrated(sys, gyro, accel, mag);
+
+    std::stringstream ss;
+    ss << "{\"sys\": " << static_cast<int>(sys)
+       << ", \"gyro\": " << static_cast<int>(gyro)
+       << ", \"accel\": " << static_cast<int>(accel)
+       << ", \"mag\": " << static_cast<int>(mag)
+       << ", \"fully_calibrated\": " << (fully_calibrated ? "true" : "false") << "}";
+
+    auto calib_msg = std_msgs::msg::String();
+    calib_msg.data = ss.str();
+    pub_calib_status_->publish(calib_msg);
+
+    RCLCPP_DEBUG(node_->get_logger(), "Calibration (inline): %s", ss.str().c_str());
+  }
 
   // Publish Euler angles (indices 18-23: heading, roll, pitch)
   auto euler_msg = geometry_msgs::msg::Vector3();

@@ -255,3 +255,16 @@ The following fixes were applied to the C++ implementation, referencing the [Ada
 - **`tcsetattr(TCSAFLUSH)`** instead of `TCSANOW` — flushes buffers atomically with termios change
 - **All blind protocol-level UART reset commands removed** from `connect()`, `disconnect()`, and fail paths — replaced with BREAK + DTR toggle
 - **DTR+RTS deasserted before close** in `disconnect()` so next opener starts clean
+
+### 11. tcdrain() after writes + 46-byte bulk read with inline calibration (`uart_connector.cpp`, `sensor_service.cpp`)
+
+**Problem:** Two inefficiencies discovered by comparing with [h4r_bosch_bno055_uart](https://github.com/Hacks4ROS/h4r_bosch_bno055_uart):
+
+1. **No tcdrain() after write**: After `::write()`, bytes may still be in the kernel TX buffer. The code immediately called `read()` for the response, creating a race condition — the BNO055 might not have received the full command yet. h4r calls `serial::flushOutput()` (= `tcdrain()`) after every write to ensure bytes are physically on the wire before reading.
+
+2. **45-byte bulk read**: The code read 45 bytes (ACCEL through TEMP, registers 0x08–0x34) and then issued a **separate** UART transaction to read CALIB_STAT (register 0x35). h4r reads 46 bytes in a single bulk read, capturing CALIB_STAT inline at no extra cost.
+
+**Fix:**
+- Added `tcdrain(fd_)` after `::write()` in both `read()` and `write()` functions — ensures command bytes are fully transmitted before expecting a response
+- Changed bulk read from 45 to **46 bytes** — includes CALIB_STAT (0x35) at buf[45]
+- Calibration status is now extracted and published inline from `get_sensor_data()`, eliminating one UART round-trip per sensor cycle

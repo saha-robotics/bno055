@@ -416,6 +416,9 @@ bool UARTConnector::read(uint8_t reg_addr, std::vector<uint8_t> & data, size_t l
       }
       continue;
     }
+    // Ensure command bytes are physically on the wire before reading response
+    // (matches h4r serial::flushOutput / pyserial's write_timeout behavior)
+    tcdrain(fd_);
 
     int result = read_response(data, length);
     if (result == 0) {
@@ -459,6 +462,8 @@ bool UARTConnector::write(uint8_t reg_addr, const std::vector<uint8_t> & data)
     }
     return false;
   }
+  // Ensure command bytes are physically on the wire before reading ACK
+  tcdrain(fd_);
 
   // BNO055 write response is always 2 bytes: [0xEE, status]
   // Status 0x01 = success, anything else = error
