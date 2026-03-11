@@ -232,3 +232,26 @@ The following fixes were applied to the C++ implementation, referencing the [Ada
 - **`on_configure()`**: Retries indefinitely with increasing delays (1s → 5s cap). The robot cannot operate without IMU, so the node waits.
 - **`UARTConnector::reset()`**: Retries indefinitely with increasing delays (200ms → 3s cap). Logs every 10 attempts to stderr.
 - **`check_watchdog()`**: When serial timeout is detected, loops continuously (reset + reconfigure) until data flows again. No more cooldown-based single attempts.
+
+### 10. Proper serial port management: DTR/RTS, BREAK, cfmakeraw (`uart_connector.cpp`)
+
+**Problem:** The C++ code managed the serial port differently from Python's `pyserial` library, causing BNO055 UART state corruption that persisted across processes:
+
+1. **No DTR/RTS control**: pyserial asserts DTR+RTS HIGH on every `serial.Serial()` open. On many USB-serial adapters (CP2104, CH340, FTDI), DTR is wired to the device's reset or power-enable pin. The C++ code never touched these lines, so the BNO055 might not be properly powered or reset.
+
+2. **Blind protocol-level reset commands**: When the BNO055's UART parser was stuck mid-command (waiting for payload bytes from a crashed process), the C++ code sent protocol-level reset commands (`0xAA 0x00 0x07...`). These bytes were interpreted as **payload data** for the previous unfinished command, potentially writing garbage to random registers and making things worse.
+
+3. **Dirty termios inheritance**: `tcgetattr()` + manual flag masking inherited stale flags from the previous process. If the previous opener left unusual termios settings, they would contaminate the new session.
+
+4. **No BREAK condition management**: A BREAK condition (TX held LOW) is the only UART-level mechanism to reset a UART parser regardless of its current state. The C++ code never used it.
+
+**Fix:** Complete rewrite of serial port management to match pyserial behavior:
+
+- **`cfmakeraw()`** used as termios baseline instead of manual flag clearing — eliminates inherited flag contamination
+- **`ioctl(TIOCMBIS, DTR|RTS)`** asserts DTR+RTS HIGH after open — matches pyserial, enables hardware reset on DTR-wired boards
+- **`ioctl(TIOCCBRK)`** clears any lingering BREAK condition from previous opener
+- **`tcsendbreak()`** sends UART-level BREAK to reset BNO055 UART parser — safe even when sensor is stuck mid-command (unlike protocol-level commands)
+- **DTR toggle** (LOW→10ms→HIGH) pulses hardware reset via DTR→RST wiring
+- **`tcsetattr(TCSAFLUSH)`** instead of `TCSANOW` — flushes buffers atomically with termios change
+- **All blind protocol-level UART reset commands removed** from `connect()`, `disconnect()`, and fail paths — replaced with BREAK + DTR toggle
+- **DTR+RTS deasserted before close** in `disconnect()` so next opener starts clean
