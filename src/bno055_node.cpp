@@ -246,22 +246,19 @@ CallbackReturn BNO055LifecycleNode::on_configure(const rclcpp_lifecycle::State &
     return CallbackReturn::FAILURE;
   }
 
-  // Persistent retry loop — never give up until sensor is online.
-  // The robot cannot operate without IMU, so keep trying forever.
-  // rclcpp::ok() check allows clean exit on Ctrl-C / shutdown.
-  for (int attempt = 1; rclcpp::ok(); attempt++) {
+  // Retry loop for hardware connection + sensor configuration
+  // USB bus contention with other devices (RealSense, LiDAR) can cause
+  // transient UART failures during concurrent startup
+  const int max_retries = 5;
+  for (int attempt = 1; attempt <= max_retries; attempt++) {
     if (attempt > 1) {
-      // Increasing delay: 1s → 2s → 3s → 4s → 5s cap
-      int delay_ms = std::min(attempt * 1000, 5000);
-      RCLCPP_WARN(get_logger(), "Configuration retry %d (next attempt in %dms)...",
-        attempt, delay_ms);
-      std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
-      if (!rclcpp::ok()) break;
+      RCLCPP_WARN(get_logger(), "Configuration retry %d/%d...", attempt, max_retries);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
 
     // Create hardware connector
     if (!create_connector()) {
-      RCLCPP_WARN(get_logger(), "Failed to create connector (attempt %d)", attempt);
+      RCLCPP_WARN(get_logger(), "Failed to create connector (attempt %d/%d)", attempt, max_retries);
       if (connector_) {
         connector_->disconnect();
         connector_.reset();
@@ -271,7 +268,7 @@ CallbackReturn BNO055LifecycleNode::on_configure(const rclcpp_lifecycle::State &
 
     // Configure sensor
     if (!configure_sensor()) {
-      RCLCPP_WARN(get_logger(), "Failed to configure sensor (attempt %d)", attempt);
+      RCLCPP_WARN(get_logger(), "Failed to configure sensor (attempt %d/%d)", attempt, max_retries);
       if (connector_) {
         connector_->disconnect();
         connector_.reset();
@@ -280,11 +277,11 @@ CallbackReturn BNO055LifecycleNode::on_configure(const rclcpp_lifecycle::State &
       continue;
     }
 
-    RCLCPP_INFO(get_logger(), "Configuration complete (attempt %d)", attempt);
+    RCLCPP_INFO(get_logger(), "Configuration complete");
     return CallbackReturn::SUCCESS;
   }
 
-  RCLCPP_ERROR(get_logger(), "Configuration aborted - ROS shutdown requested");
+  RCLCPP_ERROR(get_logger(), "Failed to configure after %d attempts", max_retries);
   return CallbackReturn::FAILURE;
 }
 

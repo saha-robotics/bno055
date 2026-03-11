@@ -298,12 +298,9 @@ void SensorService::deactivate_publishers()
 
 void SensorService::get_sensor_data()
 {
-  // Read 46 bytes starting from accelerometer data register
-  // 45 bytes = sensor data (accel through temp), +1 byte = CALIB_STAT (0x35)
-  // Reading calibration inline avoids a separate UART round-trip per cycle
-  // (matches h4r_bosch_bno055_uart's 46-byte bulk read)
+  // Read 45 bytes starting from accelerometer data register
   std::vector<uint8_t> buf;
-  if (!read_register(BNO055_ACCEL_DATA_X_LSB_ADDR, buf, 46)) {
+  if (!read_register(BNO055_ACCEL_DATA_X_LSB_ADDR, buf, 45)) {
     consecutive_error_count_++;
     RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
       "Failed to read sensor data (error count: %d)", consecutive_error_count_);
@@ -409,31 +406,6 @@ void SensorService::get_sensor_data()
   temp_msg.temperature = static_cast<double>(buf[44]);
   pub_temp_->publish(temp_msg);
 
-  // Publish calibration status inline from buf[45] (CALIB_STAT register)
-  // This avoids a separate UART read transaction for calibration
-  {
-    uint8_t calib_byte = buf[45];
-    uint8_t sys = (calib_byte >> 6) & 0x03;
-    uint8_t gyro = (calib_byte >> 4) & 0x03;
-    uint8_t accel = (calib_byte >> 2) & 0x03;
-    uint8_t mag = calib_byte & 0x03;
-
-    bool fully_calibrated = is_fully_calibrated(sys, gyro, accel, mag);
-
-    std::stringstream ss;
-    ss << "{\"sys\": " << static_cast<int>(sys)
-       << ", \"gyro\": " << static_cast<int>(gyro)
-       << ", \"accel\": " << static_cast<int>(accel)
-       << ", \"mag\": " << static_cast<int>(mag)
-       << ", \"fully_calibrated\": " << (fully_calibrated ? "true" : "false") << "}";
-
-    auto calib_msg = std_msgs::msg::String();
-    calib_msg.data = ss.str();
-    pub_calib_status_->publish(calib_msg);
-
-    RCLCPP_DEBUG(node_->get_logger(), "Calibration (inline): %s", ss.str().c_str());
-  }
-
   // Publish Euler angles (indices 18-23: heading, roll, pitch)
   auto euler_msg = geometry_msgs::msg::Vector3();
   euler_msg.x = bytes_to_int16(buf, 18) / 16.0;  // heading (degrees)
@@ -495,62 +467,57 @@ void SensorService::check_watchdog()
   }
 
   // Check serial reset timeout - reset connection and reconfigure sensor
-  // Persistent retry: keeps trying until data flows again or ROS shuts down.
-  // connector_->reset() itself also retries forever internally.
+  // Uses a cooldown period: after a failed attempt, waits before trying again
+  // to avoid rapid reset loops that could worsen cable contact issues
   if (config_.serial_reset_timeout > 0.0 && elapsed >= config_.serial_reset_timeout
       && !reset_in_progress_)
   {
     reset_in_progress_ = true;
-    set_imu_ok(false);
 
-    RCLCPP_WARN(node_->get_logger(),
-      "[Watchdog] Serial timeout: No data for %.2fs (threshold: %.2fs). "
-      "Starting persistent reconnection...", elapsed, config_.serial_reset_timeout);
+    try {
+      std::stringstream ss;
+      ss << "[Watchdog] Serial timeout detected: No data for " << std::fixed
+         << std::setprecision(2) << elapsed << "s (threshold: "
+         << config_.serial_reset_timeout << "s). Resetting serial connection...";
+      log_throttled("watchdog_serial_reset", ss.str(), 2, 10.0);
 
-    bool recovered = false;
-    for (int attempt = 1; rclcpp::ok() && !recovered; attempt++) {
-      try {
-        if (attempt > 1) {
-          // 1s delay between attempts (connector_->reset() already has internal delays)
-          std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-        }
-
-        RCLCPP_INFO(node_->get_logger(),
-          "[Watchdog] Reconnection attempt %d...", attempt);
-
-        // Reset the connector (close + reopen + BNO055 hardware reset)
-        if (connector_ && connector_->reset()) {
-          // Reconfigure the sensor after reset
-          if (configure()) {
-            last_successful_read_ = std::chrono::steady_clock::now();
-            consecutive_error_count_ = 0;
-            // Clear anomaly detection state after recovery
-            imu_constant_count_ = 0;
-            has_prev_imu_data_ = false;
-            accel_x_history_.clear();
-            accel_y_history_.clear();
-            accel_z_history_.clear();
-            RCLCPP_INFO(node_->get_logger(),
-              "[Watchdog] Sensor recovered on attempt %d", attempt);
-            recovered = true;
-          } else {
-            RCLCPP_WARN(node_->get_logger(),
-              "[Watchdog] Reset OK but reconfigure failed (attempt %d)", attempt);
-          }
+      // Reset the connector (close + reopen + BNO055 hardware reset)
+      if (connector_ && connector_->reset()) {
+        // Reconfigure the sensor after reset
+        if (configure()) {
+          last_successful_read_ = std::chrono::steady_clock::now();
+          consecutive_error_count_ = 0;
+          // Clear anomaly detection state after recovery
+          imu_constant_count_ = 0;
+          has_prev_imu_data_ = false;
+          accel_x_history_.clear();
+          accel_y_history_.clear();
+          accel_z_history_.clear();
+          log_throttled("watchdog_reset_success",
+            "Sensor reconfigured successfully after watchdog reset", 0, 10.0);
         } else {
-          RCLCPP_WARN(node_->get_logger(),
-            "[Watchdog] Serial reset failed (attempt %d)", attempt);
+          set_imu_ok(false);
+          log_throttled("watchdog_reconfig_fail",
+            "Failed to reconfigure sensor after watchdog reset - will retry next cycle", 2, 10.0);
+          // Push last_successful_read_ forward by a cooldown period so the
+          // watchdog doesn't immediately retry. This gives time for the cable
+          // to stabilize if it was an intermittent contact issue.
+          last_successful_read_ = std::chrono::steady_clock::now() -
+            std::chrono::milliseconds(static_cast<int>(config_.serial_reset_timeout * 500));
         }
-      } catch (const std::exception & e) {
-        RCLCPP_WARN(node_->get_logger(),
-          "[Watchdog] Exception on attempt %d: %s", attempt, e.what());
+      } else {
+        set_imu_ok(false);
+        log_throttled("watchdog_reset_fail",
+          "Failed to reset serial connection - will retry next cycle", 2, 10.0);
+        // Apply cooldown: set last_successful_read_ so next retry happens
+        // after ~half the serial_reset_timeout (not immediately)
+        last_successful_read_ = std::chrono::steady_clock::now() -
+          std::chrono::milliseconds(static_cast<int>(config_.serial_reset_timeout * 500));
       }
-    }
-
-    if (!recovered) {
-      // Only reached when rclcpp::ok() becomes false (ROS shutdown)
-      RCLCPP_ERROR(node_->get_logger(),
-        "[Watchdog] Reconnection aborted - ROS shutdown requested");
+    } catch (const std::exception & e) {
+      set_imu_ok(false);
+      log_throttled("watchdog_reset_exception",
+        std::string("Exception during watchdog reset: ") + e.what(), 2, 10.0);
     }
 
     reset_in_progress_ = false;
