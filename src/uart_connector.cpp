@@ -32,6 +32,7 @@
 #include <termios.h>
 #include <unistd.h>
 #include <sys/select.h>
+#include <errno.h>
 #include <cstring>
 #include <algorithm>
 
@@ -162,6 +163,31 @@ bool UARTConnector::connect()
 void UARTConnector::disconnect()
 {
   if (fd_ >= 0) {
+    // Flush kernel UART buffers so no partial command is left in the pipe
+    tcflush(fd_, TCIOFLUSH);
+
+    // Best-effort: send BNO055 hardware reset so the sensor's UART state
+    // machine returns to a known idle state.  If the next process to open
+    // this port is the Python node (or another C++ instance) it will find
+    // the sensor freshly booted instead of stuck mid-command.
+    {
+      uint8_t page_cmd[] = {COM_START_BYTE_WR, COM_WRITE, BNO055_PAGE_ID_ADDR, 0x01, 0x00};
+      ::write(fd_, page_cmd, sizeof(page_cmd));
+      usleep(5000);  // 5ms – just enough for the command to leave the FIFO
+
+      uint8_t reset_cmd[] = {COM_START_BYTE_WR, COM_WRITE, BNO055_SYS_TRIGGER_ADDR, 0x01, 0x20};
+      ::write(fd_, reset_cmd, sizeof(reset_cmd));
+      usleep(5000);  // 5ms
+    }
+
+    // Restore default termios so the port is not left with custom settings
+    // that could confuse the next opener (best-effort, ignore errors)
+    struct termios tty;
+    if (tcgetattr(fd_, &tty) == 0) {
+      cfmakeraw(&tty);
+      tcsetattr(fd_, TCSANOW, &tty);
+    }
+
     close(fd_);
     fd_ = -1;
   }
@@ -203,18 +229,67 @@ bool UARTConnector::reset()
   return false;
 }
 
+ssize_t UARTConnector::timed_read(void * buf, size_t count, int timeout_ms)
+{
+  // Use select() with explicit timeout to prevent indefinite blocking.
+  // The kernel VTIME mechanism is unreliable on some USB-serial adapters —
+  // select() gives a hard upper bound on how long we wait.
+  if (fd_ < 0) {
+    return -1;
+  }
+
+  fd_set rfds;
+  FD_ZERO(&rfds);
+  FD_SET(fd_, &rfds);
+
+  struct timeval tv;
+  tv.tv_sec = timeout_ms / 1000;
+  tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+  int sel = select(fd_ + 1, &rfds, nullptr, nullptr, &tv);
+  if (sel < 0) {
+    // select() error — check if device was removed
+    if (errno == EIO || errno == ENXIO || errno == EBADF || errno == ENODEV) {
+      close(fd_);
+      fd_ = -1;  // Mark as disconnected so watchdog can trigger reconnect
+    }
+    return -1;
+  }
+  if (sel == 0) {
+    // Timeout — no data available
+    return 0;
+  }
+
+  ssize_t n = ::read(fd_, buf, count);
+  if (n < 0) {
+    // Read error — check for device removal
+    if (errno == EIO || errno == ENXIO || errno == EBADF || errno == ENODEV) {
+      close(fd_);
+      fd_ = -1;
+    }
+  }
+  return n;
+}
+
 int UARTConnector::read_response(std::vector<uint8_t> & data, size_t expected_length)
 {
   // Read all available bytes: BNO055 read response = [0xBB, len, data...]
   // BNO055 error response = [0xEE, error_code]
   // Returns: 0 = success, >0 = BNO055 error code, -1 = comm failure
-  uint8_t byte;
+  //
+  // Use timed_read() with select() to guarantee we never block forever.
+  // Per-byte timeout: 150ms — generous enough for 115200 baud but prevents
+  // the executor thread from hanging when the sensor stops responding.
+  constexpr int BYTE_TIMEOUT_MS = 150;
+
+  uint8_t byte = 0;
   int max_attempts = 10;
   
   // Search for a valid response header byte (0xBB or 0xEE)
   for (int i = 0; i < max_attempts; i++) {
-    if (::read(fd_, &byte, 1) != 1) {
-      return -1;
+    ssize_t n = timed_read(&byte, 1, BYTE_TIMEOUT_MS);
+    if (n <= 0) {
+      return -1;  // Timeout or error
     }
     if (byte == COM_START_BYTE_RESP || byte == COM_START_BYTE_ERROR_RESP) {
       break;
@@ -227,7 +302,10 @@ int UARTConnector::read_response(std::vector<uint8_t> & data, size_t expected_le
   if (byte == COM_START_BYTE_ERROR_RESP) {
     // Read the error code byte
     uint8_t err = 0;
-    ::read(fd_, &err, 1);
+    ssize_t n = timed_read(&err, 1, BYTE_TIMEOUT_MS);
+    if (n <= 0) {
+      return -1;  // Couldn't read error code
+    }
     return static_cast<int>(err);  // Return BNO055 error code (0x07 = bus overrun, etc.)
   }
 
@@ -237,26 +315,35 @@ int UARTConnector::read_response(std::vector<uint8_t> & data, size_t expected_le
 
   // Read length byte
   uint8_t response_length;
-  if (::read(fd_, &response_length, 1) != 1) {
+  if (timed_read(&response_length, 1, BYTE_TIMEOUT_MS) != 1) {
     return -1;
   }
 
   if (response_length != expected_length) {
-    // Drain remaining bytes
+    // Drain remaining bytes (best-effort, don't block long)
     std::vector<uint8_t> drain(response_length);
-    ::read(fd_, drain.data(), response_length);
+    timed_read(drain.data(), response_length, BYTE_TIMEOUT_MS * 2);
     return -1;
   }
 
-  // Read data
+  // Read data payload
   data.resize(expected_length);
   size_t total_read = 0;
+  // Overall timeout for payload: generous but finite
+  int remaining_timeout_ms = BYTE_TIMEOUT_MS * static_cast<int>(expected_length + 1);
   while (total_read < expected_length) {
-    ssize_t n = ::read(fd_, data.data() + total_read, expected_length - total_read);
+    ssize_t n = timed_read(
+      data.data() + total_read,
+      expected_length - total_read,
+      remaining_timeout_ms);
     if (n <= 0) {
-      return -1;
+      return -1;  // Timeout or error mid-payload
     }
     total_read += static_cast<size_t>(n);
+    remaining_timeout_ms -= BYTE_TIMEOUT_MS;  // Decrease budget
+    if (remaining_timeout_ms <= 0) {
+      remaining_timeout_ms = BYTE_TIMEOUT_MS;  // Keep at least one timeout unit
+    }
   }
 
   return 0;  // Success
@@ -269,26 +356,48 @@ bool UARTConnector::read(uint8_t reg_addr, std::vector<uint8_t> & data, size_t l
   }
 
   // Retry loop: BNO055 can return 0x07 (BUS_OVER_RUN_ERROR) under high-frequency reads
+  // or 0x0A (RECEIVE_CHARACTER_TIMEOUT) when fusion is not ready yet.
   const int max_retries = 3;
   for (int attempt = 0; attempt < max_retries; attempt++) {
-    if (attempt > 0) {
-      // Wait before retry — give sensor time to recover from bus overrun
-      usleep(2000);  // 2ms
+    // Check fd_ at each attempt — timed_read() may have invalidated it
+    if (fd_ < 0) {
+      return false;
     }
 
-    // Flush input buffer before sending command to discard stale data
-    tcflush(fd_, TCIFLUSH);
+    if (attempt > 0) {
+      // Wait before retry — give sensor time to recover from bus overrun.
+      // Also wait long enough for BNO055 to finish sending any partial
+      // response from the previous failed attempt (prevents UART desync).
+      usleep(10000);  // 10ms (was 2ms — too short for 45-byte responses)
+      if (fd_ >= 0) {
+        tcflush(fd_, TCIOFLUSH);  // Flush BOTH directions to resync
+      }
+    } else {
+      // First attempt: flush input only
+      tcflush(fd_, TCIFLUSH);
+    }
 
     // Build read command: [start_byte, read_cmd, reg_addr, length]
-    std::vector<uint8_t> cmd = {COM_START_BYTE_WR, COM_READ, reg_addr, static_cast<uint8_t>(length)};
+    uint8_t cmd[] = {COM_START_BYTE_WR, COM_READ, reg_addr, static_cast<uint8_t>(length)};
     
-    if (::write(fd_, cmd.data(), cmd.size()) != static_cast<ssize_t>(cmd.size())) {
+    ssize_t written = ::write(fd_, cmd, sizeof(cmd));
+    if (written != static_cast<ssize_t>(sizeof(cmd))) {
+      // Write failed — check if device was physically removed
+      if (written < 0 && (errno == EIO || errno == ENXIO || errno == EBADF || errno == ENODEV)) {
+        close(fd_);
+        fd_ = -1;
+        return false;
+      }
       continue;
     }
 
     int result = read_response(data, length);
     if (result == 0) {
       return true;  // Success
+    }
+    // fd_ may have been invalidated inside read_response→timed_read
+    if (fd_ < 0) {
+      return false;
     }
     // Error 0x07 = BUS_OVER_RUN_ERROR — transient, worth retrying
     // Error 0x0A = RECEIVE_CHARACTER_TIMEOUT — also transient
@@ -316,14 +425,20 @@ bool UARTConnector::write(uint8_t reg_addr, const std::vector<uint8_t> & data)
   cmd.push_back(static_cast<uint8_t>(data.size()));
   cmd.insert(cmd.end(), data.begin(), data.end());
 
-  if (::write(fd_, cmd.data(), cmd.size()) != static_cast<ssize_t>(cmd.size())) {
+  ssize_t written = ::write(fd_, cmd.data(), cmd.size());
+  if (written != static_cast<ssize_t>(cmd.size())) {
+    if (written < 0 && (errno == EIO || errno == ENXIO || errno == EBADF || errno == ENODEV)) {
+      close(fd_);
+      fd_ = -1;
+    }
     return false;
   }
 
   // BNO055 write response is always 2 bytes: [0xEE, status]
   // Status 0x01 = success, anything else = error
-  uint8_t response[2];
-  ssize_t n = ::read(fd_, response, 2);
+  // Use timed_read to prevent blocking if sensor doesn't respond
+  uint8_t response[2] = {0, 0};
+  ssize_t n = timed_read(response, 2, 300);  // 300ms timeout for write ACK
   if (n != 2) {
     return false;
   }

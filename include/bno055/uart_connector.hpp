@@ -55,6 +55,11 @@ private:
   double timeout_;
   int fd_;
   
+  // Non-blocking read with explicit select() timeout (milliseconds).
+  // Returns bytes read, 0 on timeout, -1 on error.
+  // Invalidates fd_ if the device is physically removed (EIO/ENXIO).
+  ssize_t timed_read(void * buf, size_t count, int timeout_ms);
+
   // Returns: 0 = success, >0 = BNO055 error code, -1 = comm failure
   int read_response(std::vector<uint8_t> & data, size_t expected_length);
 };

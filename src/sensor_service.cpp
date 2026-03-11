@@ -83,36 +83,59 @@ bool SensorService::configure()
 {
   RCLCPP_INFO(node_->get_logger(), "Configuring device...");
 
+  // -- Adafruit pattern: set CONFIG mode first, THEN reset --
+  // BNO055 datasheet requires CONFIG mode to reliably accept SYS_TRIGGER
+  // reset. Writing reset while in a fusion mode (NDOF etc.) can be ignored.
+  RCLCPP_INFO(node_->get_logger(), "Switching to config mode before reset...");
+  {
+    std::vector<uint8_t> config_mode = {OPERATION_MODE_CONFIG};
+    // Best-effort: if this fails (e.g. sensor confused), the reset below
+    // will still attempt to bring it to a known state.
+    write_register(BNO055_OPR_MODE_ADDR, config_mode);
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+
   // Reset the sensor for a clean state
   RCLCPP_INFO(node_->get_logger(), "Resetting sensor...");
   std::vector<uint8_t> page_zero = {0x00};
   write_register(BNO055_PAGE_ID_ADDR, page_zero);
   std::vector<uint8_t> reset_trigger = {0x20};
   write_register(BNO055_SYS_TRIGGER_ADDR, reset_trigger);
-  // BNO055 needs ~650ms to boot after reset, but USB bus contention
-  // can delay responses significantly — use generous wait time
-  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+
+  // -- Adafruit pattern: poll chip ID instead of fixed sleep --
+  // Adafruit does: delay(30); while(readChipId != 0xA0) { delay(10); } delay(50);
+  // The BNO055 can take 400-850ms to boot, but polling exits as soon as ready.
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
   // Flush stale data from UART buffers after sensor reset
   if (connector_) {
     connector_->flush_buffers();
   }
 
-  // Verify chip ID (with retries - sensor may be slow after reset)
+  // Poll chip ID with 100ms intervals, up to 2 seconds total
   std::vector<uint8_t> chip_id;
   bool chip_id_ok = false;
-  for (int attempt = 0; attempt < 5; attempt++) {
-    if (attempt > 0) {
-      RCLCPP_WARN(node_->get_logger(), "Chip ID read retry %d/5...", attempt + 1);
-      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  for (int attempt = 0; attempt < 20; attempt++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (connector_) {
+      connector_->flush_buffers();
     }
     chip_id.clear();
-    if (read_register(BNO055_CHIP_ID_ADDR, chip_id, 1) && chip_id[0] == BNO055_ID) {
+    if (read_register(BNO055_CHIP_ID_ADDR, chip_id, 1) &&
+        !chip_id.empty() && chip_id[0] == BNO055_ID)
+    {
       chip_id_ok = true;
       break;
     }
+    if (attempt > 0 && attempt % 5 == 0) {
+      RCLCPP_WARN(node_->get_logger(),
+        "Waiting for BNO055 to boot after reset... (%d/20)", attempt);
+    }
   }
+  // Extra 50ms settling time after chip ID read (per Adafruit)
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
   if (!chip_id_ok) {
-    RCLCPP_ERROR(node_->get_logger(), "Failed to read correct chip ID after retries");
+    RCLCPP_ERROR(node_->get_logger(), "Failed to read correct chip ID after reset");
     return false;
   }
 
@@ -151,7 +174,8 @@ bool SensorService::configure()
   if (!write_register(BNO055_SYS_TRIGGER_ADDR, trigger)) {
     RCLCPP_WARN(node_->get_logger(), "Unable to start IMU");
   }
-  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  // Adafruit: delay(10) after clearing SYS_TRIGGER
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
   // Verify self-test result
   std::vector<uint8_t> self_test;
@@ -192,6 +216,8 @@ bool SensorService::configure()
     if (!write_register(BNO055_AXIS_MAP_CONFIG_ADDR, mount_positions[config_.placement_axis_remap])) {
       RCLCPP_WARN(node_->get_logger(), "Unable to set sensor placement configuration");
     }
+    // Adafruit: delay(10) after axis remap write
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
 
   // Set calibration offsets if configured
@@ -234,6 +260,8 @@ bool SensorService::configure()
     RCLCPP_WARN(node_->get_logger(), "Unable to set IMU operation mode");
     return false;
   }
+  // Adafruit: delay(20) after final setMode
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
   RCLCPP_INFO(node_->get_logger(), "Bosch BNO055 IMU configuration complete");
   return true;
