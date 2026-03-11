@@ -153,6 +153,19 @@ bool UARTConnector::connect()
   }
 
   if (!chip_id_ok) {
+    // BNO055 may be stuck in a confused UART state after our failed read
+    // attempts. Send a hardware reset before closing so the next process
+    // (Python node, another C++ instance, or our own retry) finds the
+    // sensor in a clean boot state — not stuck mid-command.
+    tcflush(fd_, TCIOFLUSH);
+    {
+      uint8_t page_cmd[] = {COM_START_BYTE_WR, COM_WRITE, BNO055_PAGE_ID_ADDR, 0x01, 0x00};
+      ::write(fd_, page_cmd, sizeof(page_cmd));
+      usleep(5000);  // 5ms
+      uint8_t reset_cmd[] = {COM_START_BYTE_WR, COM_WRITE, BNO055_SYS_TRIGGER_ADDR, 0x01, 0x20};
+      ::write(fd_, reset_cmd, sizeof(reset_cmd));
+      usleep(5000);  // 5ms
+    }
     close(fd_);
     fd_ = -1;
     return false;
