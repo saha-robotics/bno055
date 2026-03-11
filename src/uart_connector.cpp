@@ -28,6 +28,7 @@
 
 #include "bno055/uart_connector.hpp"
 #include "bno055/registers.hpp"
+#include <rclcpp/rclcpp.hpp>
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
@@ -202,31 +203,38 @@ void UARTConnector::flush_buffers()
 
 bool UARTConnector::reset()
 {
-  // Multi-attempt reset with increasing delays.
+  // Persistent reset loop — keeps trying until connection is re-established.
   // When the cable between UART converter and BNO055 had intermittent contact,
   // the BNO055 UART state machine may be confused. We need:
   // 1) Close and reopen the serial port (clears kernel buffers)
   // 2) Send hardware reset to BNO055 (done inside connect())
-  // 3) Retry multiple times with increasing delays
-  const int max_reset_attempts = 3;
+  // 3) Retry with increasing delays until success
   const int base_delay_ms = 200;
 
-  for (int attempt = 0; attempt < max_reset_attempts; attempt++) {
+  for (int attempt = 0; rclcpp::ok(); attempt++) {
     disconnect();
 
-    // Increasing delay: 200ms, 500ms, 1000ms
+    // Increasing delay: 200ms, 500ms, 1000ms, 1500ms, ... capped at 3000ms
     int delay_ms = base_delay_ms * (attempt + 1);
     if (attempt > 0) {
-      delay_ms += 300 * attempt;  // Extra time for BNO055 to settle
+      delay_ms += 300 * attempt;
     }
+    delay_ms = std::min(delay_ms, 3000);  // Cap at 3 seconds
     usleep(delay_ms * 1000);
 
     if (connect()) {
       return true;
     }
+
+    if (attempt > 0 && (attempt % 10) == 0) {
+      // Log every 10 attempts so operator knows node is still trying
+      // (can't use RCLCPP here — no node handle — output to stderr)
+      fprintf(stderr, "[UARTConnector::reset] Still trying to reconnect (attempt %d)...\n",
+        attempt + 1);
+    }
   }
 
-  return false;
+  return false;  // Only reached if rclcpp::ok() returns false (shutdown)
 }
 
 ssize_t UARTConnector::timed_read(void * buf, size_t count, int timeout_ms)

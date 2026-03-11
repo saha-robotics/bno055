@@ -223,3 +223,12 @@ The following fixes were applied to the C++ implementation, referencing the [Ada
 **Problem:** After writing a command to the BNO055, the code waited for an ACK byte (`0xEE 0x01`) using blocking `::read()`. If the sensor was in a bad state or disconnected, this would also block indefinitely.
 
 **Fix:** The write ACK path now uses `timed_read()` with a **300ms** timeout. If no ACK arrives within 300ms, the write is considered failed and the error is propagated, allowing the reconnection logic to kick in.
+
+### 9. Persistent (infinite) retry at all levels (`bno055_node.cpp`, `uart_connector.cpp`, `sensor_service.cpp`)
+
+**Problem:** Retry loops at every level had hard limits (5 in `on_configure`, 3 in `reset()`, 1 per watchdog cycle). When the BNO055 was temporarily unavailable (e.g. USB cable re-plugged, sensor booting slowly), these limits would be exhausted and the node would either crash or stop trying to reconnect.
+
+**Fix:** All retry loops are now **infinite** — the node keeps trying until it successfully communicates with the sensor. Clean shutdown is guaranteed via `rclcpp::ok()` checks:
+- **`on_configure()`**: Retries indefinitely with increasing delays (1s → 5s cap). The robot cannot operate without IMU, so the node waits.
+- **`UARTConnector::reset()`**: Retries indefinitely with increasing delays (200ms → 3s cap). Logs every 10 attempts to stderr.
+- **`check_watchdog()`**: When serial timeout is detected, loops continuously (reset + reconfigure) until data flows again. No more cooldown-based single attempts.
