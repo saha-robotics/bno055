@@ -416,9 +416,11 @@ bool UARTConnector::read(uint8_t reg_addr, std::vector<uint8_t> & data, size_t l
       }
       continue;
     }
-    // Ensure command bytes are physically on the wire before reading response
-    // (matches h4r serial::flushOutput / pyserial's write_timeout behavior)
-    tcdrain(fd_);
+    // Small delay to ensure command bytes are physically on the wire.
+    // tcdrain() would be ideal (h4r uses serial::flushOutput) but it can
+    // block indefinitely on some USB-serial adapters when the BNO055 UART
+    // is in a broken state. At 115200 baud, 4 bytes take ~0.35ms.
+    usleep(500);
 
     int result = read_response(data, length);
     if (result == 0) {
@@ -462,8 +464,9 @@ bool UARTConnector::write(uint8_t reg_addr, const std::vector<uint8_t> & data)
     }
     return false;
   }
-  // Ensure command bytes are physically on the wire before reading ACK
-  tcdrain(fd_);
+  // Small delay to ensure command bytes are physically on the wire.
+  // tcdrain() can block indefinitely on some USB-serial adapters.
+  usleep(500);
 
   // BNO055 write response is always 2 bytes: [0xEE, status]
   // Status 0x01 = success, anything else = error
