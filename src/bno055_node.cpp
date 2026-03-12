@@ -51,7 +51,7 @@ void BNO055LifecycleNode::declare_parameters()
   declare_parameter("connection_type", "uart");
   declare_parameter("i2c_bus", 0);
   declare_parameter("i2c_addr", static_cast<int>(BNO055_ADDRESS_A));
-  declare_parameter("uart_port", "/dev/ttyUSB0");
+  declare_parameter("uart_port", "/dev/bno055");
   declare_parameter("uart_baudrate", 115200);
   declare_parameter("uart_timeout", 0.1);
 
