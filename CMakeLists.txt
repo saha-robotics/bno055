@@ -13,6 +13,7 @@ endif()
 
 # Find dependencies
 find_package(ament_cmake REQUIRED)
+find_package(ament_cmake_python REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(lifecycle_msgs REQUIRED)
@@ -51,11 +52,12 @@ install(TARGETS
   DESTINATION lib/${PROJECT_NAME}
 )
 
-# Install Python modules (for legacy support)
-install(DIRECTORY bno055/
-  DESTINATION lib/python3/dist-packages/${PROJECT_NAME}
-  PATTERN "*.pyc" EXCLUDE
-  PATTERN "__pycache__" EXCLUDE
+# Install Python package with metadata (for entry_point executable)
+ament_python_install_package(${PROJECT_NAME})
+
+# Install Python executable script
+install(PROGRAMS scripts/bno055
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 # Install launch files
