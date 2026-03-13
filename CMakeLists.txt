@@ -76,11 +76,6 @@ install(DIRECTORY config/
   FILES_MATCHING PATTERN "*.yaml"
 )
 
-# Install resource files
-install(DIRECTORY resource/
-  DESTINATION share/${PROJECT_NAME}/resource
-)
-
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
