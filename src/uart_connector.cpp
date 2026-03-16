@@ -89,10 +89,13 @@ static void drain_fd(int fd)
 }
 
 // ── Helper: configure port with stty ───────────────────────────────────
+// IMPORTANT: must be called AFTER open() while the fd is held open.
+// On USB-serial (cp210x, ch340, etc.), when the last fd is closed the
+// kernel frees tty_struct and the next open() starts with default settings
+// (9600 baud).  Running stty while our fd keeps the tty alive ensures
+// the settings actually stick.
 static bool configure_port_stty(const std::string & port, int baudrate)
 {
-  // stty sets: baud, raw mode (no echo, no canonical, no signals),
-  // 8 data bits, no parity, 1 stop bit, no hw/sw flow control
   char cmd[256];
   snprintf(cmd, sizeof(cmd),
     "stty -F %s %d raw -echo -echoe -echok -echoctl -echoke "
@@ -110,13 +113,7 @@ static bool configure_port_stty(const std::string & port, int baudrate)
 
 bool UARTConnector::connect()
 {
-  // Configure port BEFORE opening (stty works on device file directly)
-  if (!configure_port_stty(port_, baudrate_)) {
-    fprintf(stderr, "[BNO055-DBG] Failed to configure port %s with stty\n", port_.c_str());
-    return false;
-  }
-
-  // Open the port
+  // Open the port FIRST — this keeps the tty alive so stty settings persist.
   fd_ = open(port_.c_str(), O_RDWR | O_NOCTTY);
   if (fd_ < 0) {
     fprintf(stderr, "[BNO055-DBG] open(%s) failed: errno=%d (%s)\n",
@@ -124,6 +121,14 @@ bool UARTConnector::connect()
     return false;
   }
   fprintf(stderr, "[BNO055-DBG] Opened %s fd=%d\n", port_.c_str(), fd_);
+
+  // Configure port AFTER opening (fd keeps tty_struct alive, settings stick)
+  if (!configure_port_stty(port_, baudrate_)) {
+    fprintf(stderr, "[BNO055-DBG] Failed to configure port %s with stty\n", port_.c_str());
+    close(fd_);
+    fd_ = -1;
+    return false;
+  }
 
   // Drain any stale data from previous session
   drain_fd(fd_);
