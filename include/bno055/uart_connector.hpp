@@ -30,7 +30,9 @@
 #define BNO055__UART_CONNECTOR_HPP_
 
 #include "bno055/connector.hpp"
+#include <serial/serial.h>
 #include <string>
+#include <memory>
 
 namespace bno055
 {
@@ -45,16 +47,16 @@ public:
   void disconnect() override;
   bool read(uint8_t reg_addr, std::vector<uint8_t> & data, size_t length) override;
   bool write(uint8_t reg_addr, const std::vector<uint8_t> & data) override;
-  bool is_connected() const override { return fd_ >= 0; }
+  bool is_connected() const override;
   void flush_buffers() override;
   bool reset() override;
 
 private:
   std::string port_;
   int baudrate_;
-  double timeout_;
-  int fd_;
-  
+  double timeout_;  // seconds
+  std::unique_ptr<serial::Serial> serial_;
+
   // Returns: 0 = success, >0 = BNO055 error code, -1 = comm failure
   int read_response(std::vector<uint8_t> & data, size_t expected_length);
 };

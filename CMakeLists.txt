@@ -13,6 +13,7 @@ endif()
 
 # Find dependencies
 find_package(ament_cmake REQUIRED)
+find_package(ament_cmake_python REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(lifecycle_msgs REQUIRED)
@@ -20,10 +21,24 @@ find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(example_interfaces REQUIRED)
+find_package(robot_msgs REQUIRED)
+
+# ── wjwwood/serial library (built inline as a static library) ──
+set(SERIAL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/ext/serial)
+add_library(serial_lib STATIC
+  ${SERIAL_DIR}/src/serial.cc
+  ${SERIAL_DIR}/src/impl/unix.cc
+  ${SERIAL_DIR}/src/impl/list_ports/list_ports_linux.cc
+)
+target_include_directories(serial_lib PUBLIC
+  ${SERIAL_DIR}/include
+)
+target_link_libraries(serial_lib rt pthread)
 
 # Include directories
 include_directories(
   include
+  ${SERIAL_DIR}/include
 )
 
 # C++ Lifecycle Node executable
@@ -43,7 +58,9 @@ ament_target_dependencies(bno055_lifecycle_node
   geometry_msgs
   std_msgs
   example_interfaces
+  robot_msgs
 )
+target_link_libraries(bno055_lifecycle_node serial_lib)
 
 # Install C++ executables
 install(TARGETS
@@ -51,11 +68,12 @@ install(TARGETS
   DESTINATION lib/${PROJECT_NAME}
 )
 
-# Install Python modules (for legacy support)
-install(DIRECTORY bno055/
-  DESTINATION lib/python3/dist-packages/${PROJECT_NAME}
-  PATTERN "*.pyc" EXCLUDE
-  PATTERN "__pycache__" EXCLUDE
+# Install Python package with metadata (for entry_point executable)
+ament_python_install_package(${PROJECT_NAME})
+
+# Install Python executable script
+install(PROGRAMS scripts/bno055
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 # Install launch files
@@ -72,11 +90,6 @@ install(DIRECTORY bno055/params/
 install(DIRECTORY config/
   DESTINATION share/${PROJECT_NAME}/config
   FILES_MATCHING PATTERN "*.yaml"
-)
-
-# Install resource files
-install(DIRECTORY resource/
-  DESTINATION share/${PROJECT_NAME}/resource
 )
 
 if(BUILD_TESTING)

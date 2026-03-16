@@ -28,18 +28,17 @@
 
 #include "bno055/uart_connector.hpp"
 #include "bno055/registers.hpp"
-#include <fcntl.h>
-#include <termios.h>
-#include <unistd.h>
-#include <sys/select.h>
+#include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <thread>
+#include <chrono>
 
 namespace bno055
 {
 
 UARTConnector::UARTConnector(const std::string & port, int baudrate, double timeout)
-: port_(port), baudrate_(baudrate), timeout_(timeout), fd_(-1)
+: port_(port), baudrate_(baudrate), timeout_(timeout)
 {
 }
 
@@ -50,153 +49,110 @@ UARTConnector::~UARTConnector()
 
 bool UARTConnector::connect()
 {
-  // Open with non-blocking flag to prevent blocking on port availability
-  fd_ = open(port_.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
-  
-  if (fd_ < 0) {
-    return false;
-  }
+  try {
+    // Timeout matches Python pyserial: serial.Serial(port, baud, timeout=X)
+    // simpleTimeout sets the total read timeout in milliseconds
+    uint32_t timeout_ms = static_cast<uint32_t>(timeout_ * 1000);
+    serial::Timeout to = serial::Timeout::simpleTimeout(timeout_ms);
 
-  // Clear O_NONBLOCK after opening to allow blocking reads with timeout
-  int flags = fcntl(fd_, F_GETFL, 0);
-  if (flags != -1) {
-    fcntl(fd_, F_SETFL, flags & ~O_NONBLOCK);
-  }
+    serial_ = std::make_unique<serial::Serial>(
+      port_,
+      static_cast<uint32_t>(baudrate_),
+      to,
+      serial::eightbits,
+      serial::parity_none,
+      serial::stopbits_one,
+      serial::flowcontrol_none
+    );
 
-  struct termios tty;
-  memset(&tty, 0, sizeof(tty));
-
-  if (tcgetattr(fd_, &tty) != 0) {
-    close(fd_);
-    fd_ = -1;
-    return false;
-  }
-
-  // Set baud rate
-  speed_t speed;
-  switch (baudrate_) {
-    case 9600: speed = B9600; break;
-    case 19200: speed = B19200; break;
-    case 38400: speed = B38400; break;
-    case 57600: speed = B57600; break;
-    case 115200: speed = B115200; break;
-    default: speed = B115200; break;
-  }
-  
-  cfsetospeed(&tty, speed);
-  cfsetispeed(&tty, speed);
-
-  // 8N1 mode
-  tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;
-  tty.c_cflag &= ~(PARENB | PARODD);
-  tty.c_cflag &= ~CSTOPB;
-  tty.c_cflag &= ~CRTSCTS;
-  tty.c_cflag |= CREAD | CLOCAL;
-
-  // Non-canonical mode
-  tty.c_lflag = 0;
-  tty.c_oflag = 0;
-  tty.c_iflag &= ~(IXON | IXOFF | IXANY);
-  tty.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL);
-
-  // Timeout configuration
-  tty.c_cc[VMIN] = 0;
-  tty.c_cc[VTIME] = static_cast<cc_t>(timeout_ * 10);
-
-  if (tcsetattr(fd_, TCSANOW, &tty) != 0) {
-    close(fd_);
-    fd_ = -1;
-    return false;
-  }
-
-  // Flush any stale data from previous session or partial BNO055 responses
-  tcflush(fd_, TCIOFLUSH);
-
-  // Send a blind hardware reset to BNO055 in case the sensor is in a
-  // confused UART state (e.g. after cable intermittent contact).
-  // Even if this write fails or BNO055 doesn't ACK, the reset trigger
-  // bit may reach the sensor and bring it to a known state.
-  {
-    // Set page 0 first (BNO055_PAGE_ID_ADDR=0x07, value=0x00)
-    uint8_t page_cmd[] = {COM_START_BYTE_WR, COM_WRITE, BNO055_PAGE_ID_ADDR, 0x01, 0x00};
-    ::write(fd_, page_cmd, sizeof(page_cmd));
-    usleep(10000);  // 10ms
-    // Drain any response (don't care if it fails)
-    uint8_t drain[8];
-    ::read(fd_, drain, sizeof(drain));
-
-    // Send reset trigger (BNO055_SYS_TRIGGER_ADDR=0x3F, value=0x20)
-    uint8_t reset_cmd[] = {COM_START_BYTE_WR, COM_WRITE, BNO055_SYS_TRIGGER_ADDR, 0x01, 0x20};
-    ::write(fd_, reset_cmd, sizeof(reset_cmd));
-    // BNO055 needs ~650ms to boot after reset
-    usleep(800000);  // 800ms
-    // Flush everything after reset
-    tcflush(fd_, TCIOFLUSH);
-  }
-
-  // Verify connection by reading chip ID with retries
-  // After cable reconnect + hardware reset, BNO055 may need a few attempts
-  std::vector<uint8_t> chip_id;
-  bool chip_id_ok = false;
-  for (int attempt = 0; attempt < 5; attempt++) {
-    if (attempt > 0) {
-      usleep(200000);  // 200ms between retries
-      tcflush(fd_, TCIOFLUSH);
+    if (!serial_->isOpen()) {
+      serial_.reset();
+      return false;
     }
-    chip_id.clear();
-    if (read(BNO055_CHIP_ID_ADDR, chip_id, 1) && chip_id.size() == 1 && chip_id[0] == BNO055_ID) {
-      chip_id_ok = true;
-      break;
-    }
-  }
 
-  if (!chip_id_ok) {
-    close(fd_);
-    fd_ = -1;
+    // Flush stale data from previous session
+    serial_->flush();
+
+    // Verify connection by reading chip ID
+    std::vector<uint8_t> chip_id;
+    bool chip_id_ok = false;
+    for (int attempt = 0; attempt < 5; attempt++) {
+      if (attempt > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        serial_->flush();
+      }
+      chip_id.clear();
+      if (read(BNO055_CHIP_ID_ADDR, chip_id, 1) &&
+          chip_id.size() == 1 && chip_id[0] == BNO055_ID)
+      {
+        chip_id_ok = true;
+        break;
+      }
+    }
+
+    if (!chip_id_ok) {
+      serial_->close();
+      serial_.reset();
+      return false;
+    }
+
+    return true;
+  } catch (const serial::IOException & e) {
+    fprintf(stderr, "[BNO055] serial::IOException: %s\n", e.what());
+    serial_.reset();
+    return false;
+  } catch (const std::exception & e) {
+    fprintf(stderr, "[BNO055] Exception during connect: %s\n", e.what());
+    serial_.reset();
     return false;
   }
-
-  return true;
 }
 
 void UARTConnector::disconnect()
 {
-  if (fd_ >= 0) {
-    close(fd_);
-    fd_ = -1;
+  if (serial_ && serial_->isOpen()) {
+    try {
+      serial_->close();
+    } catch (...) {}
   }
+  serial_.reset();
+}
+
+bool UARTConnector::is_connected() const
+{
+  return serial_ && serial_->isOpen();
 }
 
 void UARTConnector::flush_buffers()
 {
-  if (fd_ >= 0) {
-    tcflush(fd_, TCIOFLUSH);
+  if (is_connected()) {
+    try {
+      serial_->flush();
+    } catch (...) {}
   }
 }
 
 bool UARTConnector::reset()
 {
-  // Multi-attempt reset with increasing delays.
-  // When the cable between UART converter and BNO055 had intermittent contact,
-  // the BNO055 UART state machine may be confused. We need:
-  // 1) Close and reopen the serial port (clears kernel buffers)
-  // 2) Send hardware reset to BNO055 (done inside connect())
-  // 3) Retry multiple times with increasing delays
-  const int max_reset_attempts = 3;
+  const int max_reset_attempts = 10;
   const int base_delay_ms = 200;
 
   for (int attempt = 0; attempt < max_reset_attempts; attempt++) {
     disconnect();
 
-    // Increasing delay: 200ms, 500ms, 1000ms
     int delay_ms = base_delay_ms * (attempt + 1);
     if (attempt > 0) {
-      delay_ms += 300 * attempt;  // Extra time for BNO055 to settle
+      delay_ms += 300 * attempt;
     }
-    usleep(delay_ms * 1000);
+    delay_ms = std::min(delay_ms, 3000);
+    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
 
     if (connect()) {
       return true;
+    }
+
+    if (attempt > 0 && (attempt % 5) == 0) {
+      fprintf(stderr, "[BNO055] Still trying to reconnect (attempt %d)...\n", attempt + 1);
     }
   }
 
@@ -205,95 +161,110 @@ bool UARTConnector::reset()
 
 int UARTConnector::read_response(std::vector<uint8_t> & data, size_t expected_length)
 {
-  // Read all available bytes: BNO055 read response = [0xBB, len, data...]
+  // BNO055 read response  = [0xBB, len, data...]
   // BNO055 error response = [0xEE, error_code]
   // Returns: 0 = success, >0 = BNO055 error code, -1 = comm failure
-  uint8_t byte;
-  int max_attempts = 10;
-  
-  // Search for a valid response header byte (0xBB or 0xEE)
-  for (int i = 0; i < max_attempts; i++) {
-    if (::read(fd_, &byte, 1) != 1) {
+  try {
+    uint8_t byte = 0;
+    const int max_header_attempts = 10;
+
+    // Search for a valid response header byte
+    for (int i = 0; i < max_header_attempts; i++) {
+      size_t n = serial_->read(&byte, 1);
+      if (n != 1) {
+        return -1;  // Timeout
+      }
+      if (byte == COM_START_BYTE_RESP || byte == COM_START_BYTE_ERROR_RESP) {
+        break;
+      }
+      if (i == max_header_attempts - 1) {
+        return -1;
+      }
+    }
+
+    if (byte == COM_START_BYTE_ERROR_RESP) {
+      uint8_t err = 0;
+      if (serial_->read(&err, 1) != 1) {
+        return -1;
+      }
+      return static_cast<int>(err);
+    }
+
+    if (byte != COM_START_BYTE_RESP) {
       return -1;
     }
-    if (byte == COM_START_BYTE_RESP || byte == COM_START_BYTE_ERROR_RESP) {
-      break;
-    }
-    if (i == max_attempts - 1) {
+
+    // Read length byte
+    uint8_t response_length = 0;
+    if (serial_->read(&response_length, 1) != 1) {
       return -1;
     }
-  }
 
-  if (byte == COM_START_BYTE_ERROR_RESP) {
-    // Read the error code byte
-    uint8_t err = 0;
-    ::read(fd_, &err, 1);
-    return static_cast<int>(err);  // Return BNO055 error code (0x07 = bus overrun, etc.)
-  }
-
-  if (byte != COM_START_BYTE_RESP) {
-    return -1;
-  }
-
-  // Read length byte
-  uint8_t response_length;
-  if (::read(fd_, &response_length, 1) != 1) {
-    return -1;
-  }
-
-  if (response_length != expected_length) {
-    // Drain remaining bytes
-    std::vector<uint8_t> drain(response_length);
-    ::read(fd_, drain.data(), response_length);
-    return -1;
-  }
-
-  // Read data
-  data.resize(expected_length);
-  size_t total_read = 0;
-  while (total_read < expected_length) {
-    ssize_t n = ::read(fd_, data.data() + total_read, expected_length - total_read);
-    if (n <= 0) {
+    if (response_length != expected_length) {
+      // Drain remaining bytes
+      if (response_length > 0) {
+        std::vector<uint8_t> drain(response_length);
+        serial_->read(drain.data(), response_length);
+      }
       return -1;
     }
-    total_read += static_cast<size_t>(n);
-  }
 
-  return 0;  // Success
+    // Read data payload
+    data.resize(expected_length);
+    size_t total_read = 0;
+    while (total_read < expected_length) {
+      size_t n = serial_->read(data.data() + total_read, expected_length - total_read);
+      if (n == 0) {
+        return -1;  // Timeout
+      }
+      total_read += n;
+    }
+
+    return 0;  // Success
+  } catch (const std::exception &) {
+    return -1;
+  }
 }
 
 bool UARTConnector::read(uint8_t reg_addr, std::vector<uint8_t> & data, size_t length)
 {
-  if (fd_ < 0) {
+  if (!is_connected()) {
     return false;
   }
 
-  // Retry loop: BNO055 can return 0x07 (BUS_OVER_RUN_ERROR) under high-frequency reads
   const int max_retries = 3;
   for (int attempt = 0; attempt < max_retries; attempt++) {
-    if (attempt > 0) {
-      // Wait before retry — give sensor time to recover from bus overrun
-      usleep(2000);  // 2ms
+    if (!is_connected()) {
+      return false;
     }
 
-    // Flush input buffer before sending command to discard stale data
-    tcflush(fd_, TCIFLUSH);
+    try {
+      if (attempt > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        serial_->flushInput();
+      } else {
+        serial_->flushInput();
+      }
 
-    // Build read command: [start_byte, read_cmd, reg_addr, length]
-    std::vector<uint8_t> cmd = {COM_START_BYTE_WR, COM_READ, reg_addr, static_cast<uint8_t>(length)};
-    
-    if (::write(fd_, cmd.data(), cmd.size()) != static_cast<ssize_t>(cmd.size())) {
-      continue;
-    }
+      // Build read command: [start_byte, read_cmd, reg_addr, length]
+      uint8_t cmd[] = {COM_START_BYTE_WR, COM_READ, reg_addr, static_cast<uint8_t>(length)};
+      size_t written = serial_->write(cmd, sizeof(cmd));
+      if (written != sizeof(cmd)) {
+        continue;
+      }
 
-    int result = read_response(data, length);
-    if (result == 0) {
-      return true;  // Success
-    }
-    // Error 0x07 = BUS_OVER_RUN_ERROR — transient, worth retrying
-    // Error 0x0A = RECEIVE_CHARACTER_TIMEOUT — also transient
-    if (result != 0x07 && result != 0x0A) {
-      return false;  // Non-transient error, don't retry
+      int result = read_response(data, length);
+      if (result == 0) {
+        return true;
+      }
+      // Transient errors worth retrying
+      if (result != 0x07 && result != 0x0A) {
+        return false;
+      }
+    } catch (const serial::PortNotOpenedException &) {
+      return false;
+    } catch (const serial::IOException &) {
+      return false;
     }
   }
   return false;
@@ -301,33 +272,38 @@ bool UARTConnector::read(uint8_t reg_addr, std::vector<uint8_t> & data, size_t l
 
 bool UARTConnector::write(uint8_t reg_addr, const std::vector<uint8_t> & data)
 {
-  if (fd_ < 0) {
+  if (!is_connected()) {
     return false;
   }
 
-  // Flush input buffer before sending command to discard stale data
-  tcflush(fd_, TCIFLUSH);
+  try {
+    serial_->flushInput();
 
-  // Build write command: [start_byte, write_cmd, reg_addr, length, data...]
-  std::vector<uint8_t> cmd;
-  cmd.push_back(COM_START_BYTE_WR);
-  cmd.push_back(COM_WRITE);
-  cmd.push_back(reg_addr);
-  cmd.push_back(static_cast<uint8_t>(data.size()));
-  cmd.insert(cmd.end(), data.begin(), data.end());
+    // Build write command: [start_byte, write_cmd, reg_addr, length, data...]
+    std::vector<uint8_t> cmd;
+    cmd.push_back(COM_START_BYTE_WR);
+    cmd.push_back(COM_WRITE);
+    cmd.push_back(reg_addr);
+    cmd.push_back(static_cast<uint8_t>(data.size()));
+    cmd.insert(cmd.end(), data.begin(), data.end());
 
-  if (::write(fd_, cmd.data(), cmd.size()) != static_cast<ssize_t>(cmd.size())) {
+    size_t written = serial_->write(cmd);
+    if (written != cmd.size()) {
+      return false;
+    }
+
+    // BNO055 write response: [0xEE, status] — status 0x01 = success
+    uint8_t response[2] = {0, 0};
+    size_t n = serial_->read(response, 2);
+    if (n != 2) {
+      return false;
+    }
+    return (response[0] == COM_START_BYTE_ERROR_RESP && response[1] == 0x01);
+  } catch (const serial::PortNotOpenedException &) {
+    return false;
+  } catch (const serial::IOException &) {
     return false;
   }
-
-  // BNO055 write response is always 2 bytes: [0xEE, status]
-  // Status 0x01 = success, anything else = error
-  uint8_t response[2];
-  ssize_t n = ::read(fd_, response, 2);
-  if (n != 2) {
-    return false;
-  }
-  return (response[0] == COM_START_BYTE_ERROR_RESP && response[1] == 0x01);
 }
 
 }  // namespace bno055

@@ -165,3 +165,93 @@ To perform code linting with [flake8](https://gitlab.com/pycqa/flake8), just per
 See [www.flake8rules.com](https://www.flake8rules.com/) for more detailed information about flake8 rules.
 
 **Note:** We take advantage of [flake8's noqa mechanisim](https://flake8.pycqa.org/en/3.1.1/user/ignoring-errors.html) to selectively ignore some errors. Just search for `# noqa:` in the source code to find them.
+
+## C++ Implementation Bug Fixes
+
+The following fixes were applied to the C++ implementation, referencing the [Adafruit BNO055 Arduino library](https://github.com/adafruit/Adafruit_BNO055) as the canonical implementation.
+
+### 1. Blocking `read()` replaced with `timed_read()` using `select()` (`uart_connector.cpp`, `uart_connector.hpp`)
+
+**Problem:** The low-level `::read()` call could block indefinitely when the BNO055 sensor or USB-serial adapter stopped responding, causing the entire ROS2 node to hang.
+
+**Fix:** Added a new `timed_read()` method that wraps `::read()` with a `select()` call and an explicit timeout (default 150ms per byte). If no data arrives within the timeout, it returns -1 instead of blocking forever. Both `read_response()` and the write ACK path now use `timed_read()`.
+
+### 2. Stale file descriptor detection on device removal (`uart_connector.cpp`)
+
+**Problem:** When the USB cable was physically unplugged, `::read()` and `::write()` returned errors (EIO, ENXIO, EBADF, ENODEV) but the code did not check `errno`. The file descriptor remained open and `is_connected()` continued to return true, preventing reconnection.
+
+**Fix:** After every `::read()` and `::write()` failure, `errno` is now checked for device-removal indicators (`EIO`, `ENXIO`, `EBADF`, `ENODEV`). When detected, `fd_` is immediately set to `-1`, forcing the node to enter the reconnection path.
+
+### 3. CONFIG mode set before hardware reset (`sensor_service.cpp`)
+
+**Problem:** The BNO055 datasheet and the Adafruit library both require the sensor to be in CONFIG mode before issuing a system reset via `SYS_TRIGGER`. If the sensor is in a fusion mode (e.g. NDOF), the reset command may be ignored.
+
+**Fix:** `configure()` now explicitly sets `OPR_MODE = OPERATION_MODE_CONFIG` and waits 25ms **before** sending the reset command, matching the Adafruit `begin()` sequence.
+
+### 4. Chip ID polling instead of fixed post-reset sleep (`sensor_service.cpp`)
+
+**Problem:** After reset, the code used a fixed `1000ms` sleep. This was sometimes too long (wasting time) or too short (sensor not yet ready, causing subsequent commands to fail).
+
+**Fix:** Replaced the fixed sleep with active chip ID polling, matching the Adafruit pattern:
+- First poll: 30ms intervals, up to ~2 seconds
+- Second poll: 100ms intervals, up to ~2 seconds  
+- Final 50ms settle time after chip ID is confirmed (`BNO055_ID = 0xA0`)
+
+### 5. Watchdog timer reduced from 5s to 1s (`bno055_node.cpp`)
+
+**Problem:** The watchdog timer ran every 5 seconds, meaning a disconnection could go undetected for up to 5 seconds, causing stale data and delayed recovery.
+
+**Fix:** Watchdog period changed from `5000ms` to `1000ms` for faster disconnection detection and quicker reconnection.
+
+### 6. UART retry timing improvement (`uart_connector.cpp`)
+
+**Problem:** On read failure, the retry loop waited only 2ms and flushed only input. If the UART stream was desynchronized (e.g. mid-packet), 2ms was too short for a 45-byte frame at 115200 baud (~4ms), and leftover output data could corrupt subsequent transactions.
+
+**Fix:** Retry delay increased from `2ms` to `10ms`. Flush changed from `TCIFLUSH` (input only) to `TCIOFLUSH` (both input and output) to clear any stale data in both directions. Additionally, `fd_` validity is now checked at the start of each retry attempt.
+
+### 7. Missing delays after axis remap and mode transitions (`sensor_service.cpp`)
+
+**Problem:** Per the BNO055 datasheet, after writing axis remap registers and after any mode transition, the sensor needs time to process the command. These delays were missing, which could cause the next register write/read to fail intermittently.
+
+**Fix:**
+- Added **10ms** delay after `SYS_TRIGGER` clear (Adafruit uses 10ms)
+- Added **10ms** delay after axis remap configuration write
+- Added **20ms** delay after the final `setMode()` call (switching from CONFIG to operation mode)
+
+### 8. Write ACK uses `timed_read()` instead of blocking `read()` (`uart_connector.cpp`)
+
+**Problem:** After writing a command to the BNO055, the code waited for an ACK byte (`0xEE 0x01`) using blocking `::read()`. If the sensor was in a bad state or disconnected, this would also block indefinitely.
+
+**Fix:** The write ACK path now uses `timed_read()` with a **300ms** timeout. If no ACK arrives within 300ms, the write is considered failed and the error is propagated, allowing the reconnection logic to kick in.
+
+### 9. Persistent (infinite) retry at all levels (`bno055_node.cpp`, `uart_connector.cpp`, `sensor_service.cpp`)
+
+**Problem:** Retry loops at every level had hard limits (5 in `on_configure`, 3 in `reset()`, 1 per watchdog cycle). When the BNO055 was temporarily unavailable (e.g. USB cable re-plugged, sensor booting slowly), these limits would be exhausted and the node would either crash or stop trying to reconnect.
+
+**Fix:** All retry loops are now **infinite** — the node keeps trying until it successfully communicates with the sensor. Clean shutdown is guaranteed via `rclcpp::ok()` checks:
+- **`on_configure()`**: Retries indefinitely with increasing delays (1s → 5s cap). The robot cannot operate without IMU, so the node waits.
+- **`UARTConnector::reset()`**: Retries indefinitely with increasing delays (200ms → 3s cap). Logs every 10 attempts to stderr.
+- **`check_watchdog()`**: When serial timeout is detected, loops continuously (reset + reconfigure) until data flows again. No more cooldown-based single attempts.
+
+### 10. Proper serial port management: DTR/RTS, BREAK, cfmakeraw (`uart_connector.cpp`)
+
+**Problem:** The C++ code managed the serial port differently from Python's `pyserial` library, causing BNO055 UART state corruption that persisted across processes:
+
+1. **No DTR/RTS control**: pyserial asserts DTR+RTS HIGH on every `serial.Serial()` open. On many USB-serial adapters (CP2104, CH340, FTDI), DTR is wired to the device's reset or power-enable pin. The C++ code never touched these lines, so the BNO055 might not be properly powered or reset.
+
+2. **Blind protocol-level reset commands**: When the BNO055's UART parser was stuck mid-command (waiting for payload bytes from a crashed process), the C++ code sent protocol-level reset commands (`0xAA 0x00 0x07...`). These bytes were interpreted as **payload data** for the previous unfinished command, potentially writing garbage to random registers and making things worse.
+
+3. **Dirty termios inheritance**: `tcgetattr()` + manual flag masking inherited stale flags from the previous process. If the previous opener left unusual termios settings, they would contaminate the new session.
+
+4. **No BREAK condition management**: A BREAK condition (TX held LOW) is the only UART-level mechanism to reset a UART parser regardless of its current state. The C++ code never used it.
+
+**Fix:** Complete rewrite of serial port management to match pyserial behavior:
+
+- **`cfmakeraw()`** used as termios baseline instead of manual flag clearing — eliminates inherited flag contamination
+- **`ioctl(TIOCMBIS, DTR|RTS)`** asserts DTR+RTS HIGH after open — matches pyserial, enables hardware reset on DTR-wired boards
+- **`ioctl(TIOCCBRK)`** clears any lingering BREAK condition from previous opener
+- **`tcsendbreak()`** sends UART-level BREAK to reset BNO055 UART parser — safe even when sensor is stuck mid-command (unlike protocol-level commands)
+- **DTR toggle** (LOW→10ms→HIGH) pulses hardware reset via DTR→RST wiring
+- **`tcsetattr(TCSAFLUSH)`** instead of `TCSANOW` — flushes buffers atomically with termios change
+- **All blind protocol-level UART reset commands removed** from `connect()`, `disconnect()`, and fail paths — replaced with BREAK + DTR toggle
+- **DTR+RTS deasserted before close** in `disconnect()` so next opener starts clean
