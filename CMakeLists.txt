@@ -21,6 +21,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(example_interfaces REQUIRED)
+find_package(robot_msgs REQUIRED)
 
 # ── wjwwood/serial library (built inline as a static library) ──
 set(SERIAL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/ext/serial)
@@ -57,6 +58,7 @@ ament_target_dependencies(bno055_lifecycle_node
   geometry_msgs
   std_msgs
   example_interfaces
+  robot_msgs
 )
 target_link_libraries(bno055_lifecycle_node serial_lib)
 

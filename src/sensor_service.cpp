@@ -66,6 +66,10 @@ SensorService::SensorService(
   pub_calib_status_ = node_->create_publisher<std_msgs::msg::String>(
     config_.topic_prefix + "calib_status", 10);
 
+  // Create global log publisher
+  pub_global_log_ = node_->create_publisher<robot_msgs::msg::Log>(
+    robot_msgs::msg::RosTopicsConfig::LOGGING, 10);
+
   // Create calibration service
   calibration_service_ = node_->create_service<example_interfaces::srv::Trigger>(
     config_.topic_prefix + "calibration_request",
@@ -187,6 +191,7 @@ void SensorService::activate_publishers()
   pub_temp_->on_activate();
   pub_calib_status_->on_activate();
   pub_imu_ok_->on_activate();
+  pub_global_log_->on_activate();
 
   // Publish initial imu_ok state so subscribers receive a value immediately
   auto msg = std_msgs::msg::Bool();
@@ -204,6 +209,7 @@ void SensorService::deactivate_publishers()
   pub_temp_->on_deactivate();
   pub_calib_status_->on_deactivate();
   pub_imu_ok_->on_deactivate();
+  pub_global_log_->on_deactivate();
 }
 
 void SensorService::get_sensor_data()
@@ -584,6 +590,19 @@ void SensorService::log_throttled(
         RCLCPP_INFO(node_->get_logger(), "%s", msg.c_str());
         break;
     }
+
+    // Publish to global log topic (matching Python pub_global_log)
+    auto log_msg = robot_msgs::msg::Log();
+    log_msg.node = "bno055";
+    log_msg.log = msg;
+    switch (level) {
+      case 0:  log_msg.type = robot_msgs::msg::Log::INFO;  break;
+      case 1:  log_msg.type = robot_msgs::msg::Log::WARN;  break;
+      case 2:  log_msg.type = robot_msgs::msg::Log::ERROR; break;
+      default: log_msg.type = robot_msgs::msg::Log::INFO;  break;
+    }
+    pub_global_log_->publish(log_msg);
+
     log_throttle_map_[key] = now;
   }
 }

@@ -46,6 +46,8 @@
 #include "example_interfaces/srv/trigger.hpp"
 
 #include "bno055/connector.hpp"
+#include "robot_msgs/msg/log.hpp"
+#include "robot_msgs/msg/ros_topics_config.hpp"
 
 namespace bno055
 {
@@ -116,6 +118,7 @@ private:
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::Temperature>> pub_temp_;
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::String>> pub_calib_status_;
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::Bool>> pub_imu_ok_;
+  std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<robot_msgs::msg::Log>> pub_global_log_;
 
   // Service
   rclcpp::Service<example_interfaces::srv::Trigger>::SharedPtr calibration_service_;
