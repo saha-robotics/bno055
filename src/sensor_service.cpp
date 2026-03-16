@@ -83,10 +83,10 @@ bool SensorService::configure()
 {
   RCLCPP_INFO(node_->get_logger(), "Configuring device...");
 
-  // ── Match Python SensorService.configure() exactly ──
-  // Python flow: chip_id → CONFIG mode → power → page → trigger → units → remap
-  //              → print_calib_data → set_calib_offsets → operation mode
-  // No retries, no delays between writes, no self-test check.
+  // ── Match Adafruit BNO055 begin() flow with Python structure ──
+  // Adafruit delays: 30ms after setMode, 10ms after power/trigger, 20ms after final mode
+  // Python structure: chip_id → CONFIG → power → page → trigger → units → remap
+  //                   → print_calib_data → set_calib_offsets → operation mode
 
   // Step 1: Verify chip ID (single attempt, like Python)
   std::vector<uint8_t> chip_id;
@@ -98,17 +98,19 @@ bool SensorService::configure()
     return false;
   }
 
-  // Step 2: Set CONFIG mode (direct write, no retry, no delay — like Python)
+  // Step 2: Set CONFIG mode (Adafruit: setMode has 30ms delay)
   std::vector<uint8_t> config_mode = {OPERATION_MODE_CONFIG};
   if (!write_register(BNO055_OPR_MODE_ADDR, config_mode)) {
     RCLCPP_WARN(node_->get_logger(), "Unable to set IMU into config mode.");
   }
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
 
-  // Step 3: Set normal power mode
+  // Step 3: Set normal power mode (Adafruit: delay(10) after power)
   std::vector<uint8_t> power_mode = {POWER_MODE_NORMAL};
   if (!write_register(BNO055_PWR_MODE_ADDR, power_mode)) {
     RCLCPP_WARN(node_->get_logger(), "Unable to set IMU normal power mode.");
   }
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
   // Step 4: Set register page 0
   std::vector<uint8_t> page = {0x00};
@@ -116,11 +118,12 @@ bool SensorService::configure()
     RCLCPP_WARN(node_->get_logger(), "Unable to set IMU register page 0.");
   }
 
-  // Step 5: SYS_TRIGGER = 0x00 (start, NO reset)
+  // Step 5: SYS_TRIGGER = 0x00 (start, NO reset) (Adafruit: delay(10) after)
   std::vector<uint8_t> trigger = {0x00};
   if (!write_register(BNO055_SYS_TRIGGER_ADDR, trigger)) {
     RCLCPP_WARN(node_->get_logger(), "Unable to start IMU.");
   }
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
   // Step 6: Set units
   std::vector<uint8_t> units = {0x83};
@@ -128,7 +131,7 @@ bool SensorService::configure()
     RCLCPP_WARN(node_->get_logger(), "Unable to set IMU units.");
   }
 
-  // Step 7: Axis remapping (2 bytes)
+  // Step 7: Axis remapping (2 bytes) (Adafruit: delay(10) after remap)
   std::map<std::string, std::vector<uint8_t>> mount_positions = {
     {"P0", {0x21, 0x04}},
     {"P1", {0x24, 0x00}},
@@ -144,6 +147,7 @@ bool SensorService::configure()
     if (!write_register(BNO055_AXIS_MAP_CONFIG_ADDR, mount_positions[config_.placement_axis_remap])) {
       RCLCPP_WARN(node_->get_logger(), "Unable to set sensor placement configuration.");
     }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
 
   // Step 8: Show current sensor offsets (like Python print_calib_data)
@@ -159,12 +163,15 @@ bool SensorService::configure()
     }
   }
 
-  // Step 10: Set operation mode (direct write, no delay — like Python)
+  // Step 10: Set operation mode (Adafruit: setMode=30ms + extra delay(20))
   RCLCPP_INFO(node_->get_logger(), "Setting device_mode to %d", config_.operation_mode);
   std::vector<uint8_t> op_mode = {config_.operation_mode};
   if (!write_register(BNO055_OPR_MODE_ADDR, op_mode)) {
     RCLCPP_WARN(node_->get_logger(), "Unable to set IMU operation mode into operation mode.");
   }
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
+  // Adafruit: extra delay(20) after final setMode in begin()
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
   RCLCPP_INFO(node_->get_logger(), "Bosch BNO055 IMU configuration complete.");
   return true;
@@ -579,27 +586,49 @@ void SensorService::calibration_request_callback(
   const std::shared_ptr<example_interfaces::srv::Trigger::Request> request,
   std::shared_ptr<example_interfaces::srv::Trigger::Response> response)
 {
-  (void)request;  // Unused
+  (void)request;
 
-  // Read calibration status
-  std::vector<uint8_t> calib_data;
-  if (read_register(BNO055_CALIB_STAT_ADDR, calib_data, 1)) {
-    uint8_t sys = (calib_data[0] >> 6) & 0x03;
-    uint8_t gyro = (calib_data[0] >> 4) & 0x03;
-    uint8_t accel = (calib_data[0] >> 2) & 0x03;
-    uint8_t mag = calib_data[0] & 0x03;
+  // Adafruit getSensorOffsets: switch to CONFIG, read all offsets, restore mode
+  std::vector<uint8_t> config_mode = {OPERATION_MODE_CONFIG};
+  if (!write_register(BNO055_OPR_MODE_ADDR, config_mode)) {
+    response->success = false;
+    response->message = "Failed to enter config mode";
+    return;
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(25));
 
+  // Read all offset/radius data (22 bytes like Adafruit)
+  std::vector<uint8_t> accel_off, mag_off, gyro_off, accel_rad, mag_rad;
+  bool ok = read_register(ACCEL_OFFSET_X_LSB_ADDR, accel_off, 6) &&
+            read_register(MAG_OFFSET_X_LSB_ADDR, mag_off, 6) &&
+            read_register(GYRO_OFFSET_X_LSB_ADDR, gyro_off, 6) &&
+            read_register(ACCEL_RADIUS_LSB_ADDR, accel_rad, 2) &&
+            read_register(MAG_RADIUS_LSB_ADDR, mag_rad, 2);
+
+  // Restore operation mode (Adafruit: setMode(lastMode))
+  std::vector<uint8_t> op_mode = {config_.operation_mode};
+  write_register(BNO055_OPR_MODE_ADDR, op_mode);
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+  if (ok) {
     std::stringstream ss;
-    ss << "Calibration status - System: " << static_cast<int>(sys)
-       << ", Gyro: " << static_cast<int>(gyro)
-       << ", Accel: " << static_cast<int>(accel)
-       << ", Mag: " << static_cast<int>(mag);
-
+    ss << "{\"accel_offset\": {\"x\": " << ((accel_off[1] << 8) | accel_off[0])
+       << ", \"y\": " << ((accel_off[3] << 8) | accel_off[2])
+       << ", \"z\": " << ((accel_off[5] << 8) | accel_off[4])
+       << "}, \"accel_radius\": " << ((accel_rad[1] << 8) | accel_rad[0])
+       << ", \"mag_offset\": {\"x\": " << ((mag_off[1] << 8) | mag_off[0])
+       << ", \"y\": " << ((mag_off[3] << 8) | mag_off[2])
+       << ", \"z\": " << ((mag_off[5] << 8) | mag_off[4])
+       << "}, \"mag_radius\": " << ((mag_rad[1] << 8) | mag_rad[0])
+       << ", \"gyro_offset\": {\"x\": " << ((gyro_off[1] << 8) | gyro_off[0])
+       << ", \"y\": " << ((gyro_off[3] << 8) | gyro_off[2])
+       << ", \"z\": " << ((gyro_off[5] << 8) | gyro_off[4])
+       << "}}";
     response->success = true;
     response->message = ss.str();
   } else {
     response->success = false;
-    response->message = "Failed to read calibration status";
+    response->message = "Failed to read calibration offsets";
   }
 }
 
@@ -643,14 +672,13 @@ void SensorService::print_calib_data()
 
 bool SensorService::set_calib_offsets()
 {
-  // Python: Must switch to config mode + 25ms delay before writing offsets
-  std::vector<uint8_t> config_mode = {OPERATION_MODE_CONFIG};
-  if (!write_register(BNO055_OPR_MODE_ADDR, config_mode)) {
-    RCLCPP_ERROR(node_->get_logger(), "Unable to set IMU into config mode");
-  }
-  std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  // Already in CONFIG mode from configure() — no need to switch again.
+  // Adafruit: setSensorOffsets does CONFIG + delay(25), but we're called
+  // from within configure() which already set CONFIG mode.
+  // Adafruit note: "Seems to only work when writing 1 register at a time"
+  // Adafruit note: "Configuration will take place only when user writes to
+  //   the last byte of each config data pair (ex. ACCEL_OFFSET_Z_MSB_ADDR)"
 
-  // Python: "Seems to only work when writing 1 register at a time"
   auto write_byte = [this](uint8_t reg, uint8_t value) -> bool {
     std::vector<uint8_t> data = {value};
     return write_register(reg, data);
