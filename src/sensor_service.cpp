@@ -267,14 +267,20 @@ void SensorService::get_sensor_data()
   double qy = static_cast<double>(bytes_to_int16(buf, 28));
   double qz = static_cast<double>(bytes_to_int16(buf, 30));
 
-  // Normalize quaternion
+  // Normalize quaternion — skip entire cycle if norm is zero
+  // (sensor not ready / data fusion incomplete). Matches Python behavior
+  // where ZeroDivisionError causes the cycle to be skipped entirely,
+  // preventing corrupt (0,0,0,0) quaternion from reaching EKF/TF.
   double norm = std::sqrt(qx * qx + qy * qy + qz * qz + qw * qw);
-  if (norm > 0.0) {
-    imu_msg.orientation.x = qx / norm;
-    imu_msg.orientation.y = qy / norm;
-    imu_msg.orientation.z = qz / norm;
-    imu_msg.orientation.w = qw / norm;
+  if (norm == 0.0) {
+    RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+      "Quaternion norm is zero (data fusion not ready) - skipping cycle");
+    return;
   }
+  imu_msg.orientation.x = qx / norm;
+  imu_msg.orientation.y = qy / norm;
+  imu_msg.orientation.z = qz / norm;
+  imu_msg.orientation.w = qw / norm;
 
   // Linear acceleration (indices 32-37)
   imu_msg.linear_acceleration.x = bytes_to_int16(buf, 32) / config_.acc_factor;
