@@ -84,97 +84,51 @@ bool SensorService::configure()
   RCLCPP_INFO(node_->get_logger(), "Configuring device...");
 
   // ── Match Python SensorService.configure() exactly ──
-  // Python does NOT reset the sensor. It only:
-  //   1. Read chip ID to verify communication
-  //   2. Set CONFIG mode
-  //   3. Set power/page/trigger/units/axis
-  //   4. Set operation mode
-  // The SYS_TRIGGER 0x20 reset was killing the BNO055 and it would not
-  // recover without physical power cycle.
+  // Python flow: chip_id → CONFIG mode → power → page → trigger → units → remap
+  //              → print_calib_data → set_calib_offsets → operation mode
+  // No retries, no delays between writes, no self-test check.
 
-  // Step 1: Verify chip ID (first communication check)
+  // Step 1: Verify chip ID (single attempt, like Python)
   std::vector<uint8_t> chip_id;
-  bool chip_id_ok = false;
-  for (int attempt = 0; attempt < 5; attempt++) {
-    if (attempt > 0) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(200));
-      if (connector_) connector_->flush_buffers();
-    }
-    chip_id.clear();
-    if (read_register(BNO055_CHIP_ID_ADDR, chip_id, 1) &&
-        !chip_id.empty() && chip_id[0] == BNO055_ID)
-    {
-      chip_id_ok = true;
-      break;
-    }
-  }
-  if (!chip_id_ok) {
-    RCLCPP_ERROR(node_->get_logger(), "Failed to read correct chip ID");
+  if (!read_register(BNO055_CHIP_ID_ADDR, chip_id, 1) ||
+      chip_id.empty() || chip_id[0] != BNO055_ID)
+  {
+    RCLCPP_ERROR(node_->get_logger(), "Communication error: Device ID=%s is incorrect",
+      chip_id.empty() ? "(no response)" : std::to_string(chip_id[0]).c_str());
     return false;
   }
-  RCLCPP_INFO(node_->get_logger(), "Chip ID verified: 0xA0");
 
-  // Step 2: Set CONFIG mode
-  bool config_mode_ok = false;
-  for (int attempt = 0; attempt < 5; attempt++) {
-    if (attempt > 0) {
-      RCLCPP_WARN(node_->get_logger(), "Config mode retry %d/5...", attempt + 1);
-      std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    }
-    if (set_mode(OPERATION_MODE_CONFIG)) {
-      config_mode_ok = true;
-      break;
-    }
-  }
-  if (!config_mode_ok) {
-    RCLCPP_WARN(node_->get_logger(), "Unable to set IMU into config mode");
-    return false;
+  // Step 2: Set CONFIG mode (direct write, no retry, no delay — like Python)
+  std::vector<uint8_t> config_mode = {OPERATION_MODE_CONFIG};
+  if (!write_register(BNO055_OPR_MODE_ADDR, config_mode)) {
+    RCLCPP_WARN(node_->get_logger(), "Unable to set IMU into config mode.");
   }
 
   // Step 3: Set normal power mode
   std::vector<uint8_t> power_mode = {POWER_MODE_NORMAL};
   if (!write_register(BNO055_PWR_MODE_ADDR, power_mode)) {
-    RCLCPP_WARN(node_->get_logger(), "Unable to set IMU normal power mode");
+    RCLCPP_WARN(node_->get_logger(), "Unable to set IMU normal power mode.");
   }
-  std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
   // Step 4: Set register page 0
   std::vector<uint8_t> page = {0x00};
   if (!write_register(BNO055_PAGE_ID_ADDR, page)) {
-    RCLCPP_WARN(node_->get_logger(), "Unable to set IMU register page 0");
+    RCLCPP_WARN(node_->get_logger(), "Unable to set IMU register page 0.");
   }
 
   // Step 5: SYS_TRIGGER = 0x00 (start, NO reset)
   std::vector<uint8_t> trigger = {0x00};
   if (!write_register(BNO055_SYS_TRIGGER_ADDR, trigger)) {
-    RCLCPP_WARN(node_->get_logger(), "Unable to start IMU");
-  }
-  std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-  // Verify self-test result
-  std::vector<uint8_t> self_test;
-  if (read_register(BNO055_SELFTEST_RESULT_ADDR, self_test, 1)) {
-    if ((self_test[0] & SELFTEST_ALL_PASSED) != SELFTEST_ALL_PASSED) {
-      RCLCPP_WARN(node_->get_logger(),
-        "Self-test incomplete: 0x%02X (expected 0x%02X) - "
-        "ACC:%s MAG:%s GYR:%s MCU:%s",
-        self_test[0], SELFTEST_ALL_PASSED,
-        (self_test[0] & 0x01) ? "OK" : "FAIL",
-        (self_test[0] & 0x02) ? "OK" : "FAIL",
-        (self_test[0] & 0x04) ? "OK" : "FAIL",
-        (self_test[0] & 0x08) ? "OK" : "FAIL");
-    } else {
-      RCLCPP_INFO(node_->get_logger(), "Self-test passed (all sensors OK)");
-    }
+    RCLCPP_WARN(node_->get_logger(), "Unable to start IMU.");
   }
 
-  // Set units: Android orientation mode, degrees, Celsius
+  // Step 6: Set units
   std::vector<uint8_t> units = {0x83};
   if (!write_register(BNO055_UNIT_SEL_ADDR, units)) {
-    RCLCPP_WARN(node_->get_logger(), "Unable to set IMU units");
+    RCLCPP_WARN(node_->get_logger(), "Unable to set IMU units.");
   }
 
-  // Axis remapping based on placement
+  // Step 7: Axis remapping (2 bytes)
   std::map<std::string, std::vector<uint8_t>> mount_positions = {
     {"P0", {0x21, 0x04}},
     {"P1", {0x24, 0x00}},
@@ -188,56 +142,31 @@ bool SensorService::configure()
 
   if (mount_positions.find(config_.placement_axis_remap) != mount_positions.end()) {
     if (!write_register(BNO055_AXIS_MAP_CONFIG_ADDR, mount_positions[config_.placement_axis_remap])) {
-      RCLCPP_WARN(node_->get_logger(), "Unable to set sensor placement configuration");
+      RCLCPP_WARN(node_->get_logger(), "Unable to set sensor placement configuration.");
     }
-    // Adafruit: delay(10) after axis remap write
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
 
-  // Set calibration offsets if configured
+  // Step 8: Show current sensor offsets (like Python print_calib_data)
+  print_calib_data();
+
+  // Step 9: Set calibration offsets if configured
   if (config_.set_offsets) {
-    RCLCPP_INFO(node_->get_logger(), "Writing calibration offsets to sensor registers");
-
-    if (config_.offset_acc.size() >= 3) {
-      write_offset(ACCEL_OFFSET_X_LSB_ADDR, config_.offset_acc[0]);
-      write_offset(ACCEL_OFFSET_Y_LSB_ADDR, config_.offset_acc[1]);
-      write_offset(ACCEL_OFFSET_Z_LSB_ADDR, config_.offset_acc[2]);
-      RCLCPP_INFO(node_->get_logger(), "  Accel offsets: [%d, %d, %d]",
-        config_.offset_acc[0], config_.offset_acc[1], config_.offset_acc[2]);
+    if (set_calib_offsets()) {
+      RCLCPP_INFO(node_->get_logger(), "Successfully configured sensor offsets to:");
+      print_calib_data();
+    } else {
+      RCLCPP_WARN(node_->get_logger(), "setting offsets failed");
     }
-
-    if (config_.offset_mag.size() >= 3) {
-      write_offset(MAG_OFFSET_X_LSB_ADDR, config_.offset_mag[0]);
-      write_offset(MAG_OFFSET_Y_LSB_ADDR, config_.offset_mag[1]);
-      write_offset(MAG_OFFSET_Z_LSB_ADDR, config_.offset_mag[2]);
-      RCLCPP_INFO(node_->get_logger(), "  Mag offsets: [%d, %d, %d]",
-        config_.offset_mag[0], config_.offset_mag[1], config_.offset_mag[2]);
-    }
-
-    if (config_.offset_gyr.size() >= 3) {
-      write_offset(GYRO_OFFSET_X_LSB_ADDR, config_.offset_gyr[0]);
-      write_offset(GYRO_OFFSET_Y_LSB_ADDR, config_.offset_gyr[1]);
-      write_offset(GYRO_OFFSET_Z_LSB_ADDR, config_.offset_gyr[2]);
-      RCLCPP_INFO(node_->get_logger(), "  Gyro offsets: [%d, %d, %d]",
-        config_.offset_gyr[0], config_.offset_gyr[1], config_.offset_gyr[2]);
-    }
-
-    // Write accelerometer and magnetometer radius
-    write_offset(ACCEL_RADIUS_LSB_ADDR, config_.radius_acc);
-    write_offset(MAG_RADIUS_LSB_ADDR, config_.radius_mag);
-    RCLCPP_INFO(node_->get_logger(), "  Accel radius: %d, Mag radius: %d",
-      config_.radius_acc, config_.radius_mag);
   }
 
-  // Set operation mode
-  if (!set_mode(config_.operation_mode)) {
-    RCLCPP_WARN(node_->get_logger(), "Unable to set IMU operation mode");
-    return false;
+  // Step 10: Set operation mode (direct write, no delay — like Python)
+  RCLCPP_INFO(node_->get_logger(), "Setting device_mode to %d", config_.operation_mode);
+  std::vector<uint8_t> op_mode = {config_.operation_mode};
+  if (!write_register(BNO055_OPR_MODE_ADDR, op_mode)) {
+    RCLCPP_WARN(node_->get_logger(), "Unable to set IMU operation mode into operation mode.");
   }
-  // Adafruit: delay(20) after final setMode
-  std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
-  RCLCPP_INFO(node_->get_logger(), "Bosch BNO055 IMU configuration complete");
+  RCLCPP_INFO(node_->get_logger(), "Bosch BNO055 IMU configuration complete.");
   return true;
 }
 
@@ -325,11 +254,11 @@ void SensorService::get_sensor_data()
   imu_msg.header.stamp = now;
   imu_msg.header.frame_id = config_.frame_id;
 
-  // Quaternion data (indices 24-31)
-  double qw = bytes_to_int16(buf, 24) / 16384.0;  // Scale factor for quaternion
-  double qx = bytes_to_int16(buf, 26) / 16384.0;
-  double qy = bytes_to_int16(buf, 28) / 16384.0;
-  double qz = bytes_to_int16(buf, 30) / 16384.0;
+  // Quaternion data (indices 24-31) - raw int16 like Python
+  double qw = static_cast<double>(bytes_to_int16(buf, 24));
+  double qx = static_cast<double>(bytes_to_int16(buf, 26));
+  double qy = static_cast<double>(bytes_to_int16(buf, 28));
+  double qz = static_cast<double>(bytes_to_int16(buf, 30));
 
   // Normalize quaternion
   double norm = std::sqrt(qx * qx + qy * qy + qz * qz + qw * qw);
@@ -424,11 +353,13 @@ void SensorService::get_calib_status()
 
 void SensorService::check_watchdog()
 {
+  // ── Match Python check_watchdog() exactly ──
+  // Python: single reset attempt, no extra register reads
   auto now = std::chrono::steady_clock::now();
   double elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
     now - last_successful_read_).count() / 1000.0;
 
-  // Check imu_ok timeout - set imu_ok to false if no data for too long
+  // Check imu_ok timeout
   if (config_.imu_ok_timeout > 0.0 && elapsed >= config_.imu_ok_timeout) {
     if (imu_ok_) {
       set_imu_ok(false);
@@ -440,33 +371,22 @@ void SensorService::check_watchdog()
     }
   }
 
-  // Check serial reset timeout - reset connection and reconfigure sensor
-  // Persistent retry: keeps trying until data flows again or ROS shuts down.
-  // connector_->reset() itself also retries forever internally.
+  // Check serial reset timeout (single attempt like Python)
   if (config_.serial_reset_timeout > 0.0 && elapsed >= config_.serial_reset_timeout
       && !reset_in_progress_)
   {
     reset_in_progress_ = true;
-    set_imu_ok(false);
 
-    RCLCPP_WARN(node_->get_logger(),
-      "[Watchdog] Serial timeout: No data for %.2fs (threshold: %.2fs). "
-      "Starting persistent reconnection...", elapsed, config_.serial_reset_timeout);
+    try {
+      std::stringstream ss;
+      ss << "[Watchdog] Serial timeout detected: No data received for "
+         << std::fixed << std::setprecision(2) << elapsed << " seconds (threshold: "
+         << config_.serial_reset_timeout << "s). Resetting serial connection...";
+      log_throttled("watchdog_serial_reset", ss.str(), 2, 10.0);
 
-    bool recovered = false;
-    for (int attempt = 1; rclcpp::ok() && !recovered; attempt++) {
-      try {
-        if (attempt > 1) {
-          // 1s delay between attempts (connector_->reset() already has internal delays)
-          std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-        }
-
-        RCLCPP_INFO(node_->get_logger(),
-          "[Watchdog] Reconnection attempt %d...", attempt);
-
-        // Reset the connector (close + reopen + BNO055 hardware reset)
-        if (connector_ && connector_->reset()) {
-          // Reconfigure the sensor after reset
+      // Reset the connector (single attempt like Python)
+      if (connector_ && connector_->reset()) {
+        try {
           if (configure()) {
             last_successful_read_ = std::chrono::steady_clock::now();
             consecutive_error_count_ = 0;
@@ -476,65 +396,38 @@ void SensorService::check_watchdog()
             accel_x_history_.clear();
             accel_y_history_.clear();
             accel_z_history_.clear();
-            RCLCPP_INFO(node_->get_logger(),
-              "[Watchdog] Sensor recovered on attempt %d", attempt);
-            recovered = true;
+            log_throttled("watchdog_reset_success",
+              "Sensor reconfigured after watchdog reset", 0, 10.0);
           } else {
-            RCLCPP_WARN(node_->get_logger(),
-              "[Watchdog] Reset OK but reconfigure failed (attempt %d)", attempt);
+            set_imu_ok(false);
+            log_throttled("watchdog_reset_fail",
+              "Failed to reconfigure sensor after watchdog reset", 2, 10.0);
           }
-        } else {
-          RCLCPP_WARN(node_->get_logger(),
-            "[Watchdog] Serial reset failed (attempt %d)", attempt);
+        } catch (const std::exception & e) {
+          set_imu_ok(false);
+          std::stringstream err;
+          err << "Failed to reconfigure sensor after watchdog reset: " << e.what();
+          log_throttled("watchdog_reset_fail", err.str(), 2, 10.0);
         }
-      } catch (const std::exception & e) {
-        RCLCPP_WARN(node_->get_logger(),
-          "[Watchdog] Exception on attempt %d: %s", attempt, e.what());
+      } else {
+        set_imu_ok(false);
+        log_throttled("watchdog_reset_fail",
+          "Failed to reset serial connection", 2, 10.0);
       }
-    }
-
-    if (!recovered) {
-      // Only reached when rclcpp::ok() becomes false (ROS shutdown)
-      RCLCPP_ERROR(node_->get_logger(),
-        "[Watchdog] Reconnection aborted - ROS shutdown requested");
+    } catch (...) {
+      // ensure reset_in_progress_ is cleared
     }
 
     reset_in_progress_ = false;
-  }
-
-  // Check for connection issues based on system status and self test
-  // Only check if we're not in a timeout state (no point reading registers if connection is down)
-  if (elapsed < config_.serial_reset_timeout) {
-    std::vector<uint8_t> sys_status, sys_err, self_test;
-  
-    if (read_register(BNO055_SYS_STAT_ADDR, sys_status, 1) &&
-        read_register(BNO055_SYS_ERR_ADDR, sys_err, 1) &&
-        read_register(BNO055_SELFTEST_RESULT_ADDR, self_test, 1))
-    {
-      // System status: 0=idle, 1=sys error, 2=init peripheral, 3=init system,
-      //                4=executing, 5=running, 6=running without fusion
-      if (sys_status[0] == 1 || sys_err[0] != 0) {
-        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
-          "System error detected - Status: %d, Error: %d", sys_status[0], sys_err[0]);
-      }
-    
-      // Self test result: bit 0=accelerometer, 1=magnetometer, 2=gyroscope, 3=MCU
-      if (self_test[0] != SELFTEST_ALL_PASSED) {
-        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 10000,
-          "Self-test failed: 0x%02X (expected 0x%02X)", self_test[0], SELFTEST_ALL_PASSED);
-      }
-    }
-  }
-
-  // Check for timeout
-  if (elapsed > 2.0) {
-    RCLCPP_ERROR_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
-      "No data received for %.2f seconds - possible connection loss", elapsed);
   }
 }
 
 void SensorService::check_imu_anomalies(const sensor_msgs::msg::Imu & imu_msg)
 {
+  // ── Match Python _check_imu_anomalies() exactly ──
+  // Python sets imu_ok as a plain variable, then publishes ONLY at the end
+  // if the value changed. This avoids rapid true/false oscillation.
+
   if (has_prev_imu_data_) {
     // Check if IMU data is constant (sensor stuck)
     bool is_constant = (
@@ -559,11 +452,11 @@ void SensorService::check_imu_anomalies(const sensor_msgs::msg::Imu & imu_msg)
            << ", " << imu_msg.angular_velocity.y
            << ", " << imu_msg.angular_velocity.z << ")";
         log_throttled("imu_constant", ss.str(), 1, 5.0);
-        set_imu_ok(false);
+        imu_ok_ = false;
       }
     } else {
       imu_constant_count_ = 0;
-      set_imu_ok(true);
+      imu_ok_ = true;
     }
   }
 
@@ -616,7 +509,7 @@ void SensorService::check_imu_anomalies(const sensor_msgs::msg::Imu & imu_msg)
          << " m/s² | Mean: (" << std::setprecision(3)
          << mean_x << ", " << mean_y << ", " << mean_z << ")";
       log_throttled("imu_std_dev", ss.str(), 1, 5.0);
-      set_imu_ok(false);
+      imu_ok_ = false;
     }
   }
 
@@ -628,6 +521,14 @@ void SensorService::check_imu_anomalies(const sensor_msgs::msg::Imu & imu_msg)
   prev_gyro_y_ = imu_msg.angular_velocity.y;
   prev_gyro_z_ = imu_msg.angular_velocity.z;
   has_prev_imu_data_ = true;
+
+  // Publish imu_ok status only when it changes (matching Python exactly)
+  if (imu_ok_ != prev_imu_ok_) {
+    auto msg = std_msgs::msg::Bool();
+    msg.data = imu_ok_;
+    pub_imu_ok_->publish(msg);
+    prev_imu_ok_ = imu_ok_;
+  }
 }
 
 void SensorService::set_imu_ok(bool value)
@@ -702,24 +603,96 @@ void SensorService::calibration_request_callback(
   }
 }
 
-bool SensorService::set_mode(uint8_t mode)
+void SensorService::print_calib_data()
 {
-  std::vector<uint8_t> data = {mode};
-  bool result = write_register(BNO055_OPR_MODE_ADDR, data);
-  // BNO055 requires a delay after mode transition (per datasheet: 19ms typical)
-  std::this_thread::sleep_for(std::chrono::milliseconds(30));
-  return result;
+  RCLCPP_INFO(node_->get_logger(), "Current sensor offsets:");
+
+  std::vector<uint8_t> accel_offset, mag_offset, gyro_offset, accel_radius, mag_radius;
+
+  if (read_register(ACCEL_OFFSET_X_LSB_ADDR, accel_offset, 6)) {
+    uint16_t x = (accel_offset[1] << 8) | accel_offset[0];
+    uint16_t y = (accel_offset[3] << 8) | accel_offset[2];
+    uint16_t z = (accel_offset[5] << 8) | accel_offset[4];
+    RCLCPP_INFO(node_->get_logger(), "\tAccel offsets (x y z): %d %d %d", x, y, z);
+  }
+
+  if (read_register(ACCEL_RADIUS_LSB_ADDR, accel_radius, 2)) {
+    uint16_t r = (accel_radius[1] << 8) | accel_radius[0];
+    RCLCPP_INFO(node_->get_logger(), "\tAccel radius: %d", r);
+  }
+
+  if (read_register(MAG_OFFSET_X_LSB_ADDR, mag_offset, 6)) {
+    uint16_t x = (mag_offset[1] << 8) | mag_offset[0];
+    uint16_t y = (mag_offset[3] << 8) | mag_offset[2];
+    uint16_t z = (mag_offset[5] << 8) | mag_offset[4];
+    RCLCPP_INFO(node_->get_logger(), "\tMag offsets (x y z): %d %d %d", x, y, z);
+  }
+
+  if (read_register(MAG_RADIUS_LSB_ADDR, mag_radius, 2)) {
+    uint16_t r = (mag_radius[1] << 8) | mag_radius[0];
+    RCLCPP_INFO(node_->get_logger(), "\tMag radius: %d", r);
+  }
+
+  if (read_register(GYRO_OFFSET_X_LSB_ADDR, gyro_offset, 6)) {
+    uint16_t x = (gyro_offset[1] << 8) | gyro_offset[0];
+    uint16_t y = (gyro_offset[3] << 8) | gyro_offset[2];
+    uint16_t z = (gyro_offset[5] << 8) | gyro_offset[4];
+    RCLCPP_INFO(node_->get_logger(), "\tGyro offsets (x y z): %d %d %d", x, y, z);
+  }
 }
 
-void SensorService::write_offset(uint8_t reg_lsb, int16_t value)
+bool SensorService::set_calib_offsets()
 {
-  std::vector<uint8_t> data = {
-    static_cast<uint8_t>(value & 0xFF),
-    static_cast<uint8_t>((value >> 8) & 0xFF)
+  // Python: Must switch to config mode + 25ms delay before writing offsets
+  std::vector<uint8_t> config_mode = {OPERATION_MODE_CONFIG};
+  if (!write_register(BNO055_OPR_MODE_ADDR, config_mode)) {
+    RCLCPP_ERROR(node_->get_logger(), "Unable to set IMU into config mode");
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(25));
+
+  // Python: "Seems to only work when writing 1 register at a time"
+  auto write_byte = [this](uint8_t reg, uint8_t value) -> bool {
+    std::vector<uint8_t> data = {value};
+    return write_register(reg, data);
   };
-  if (!write_register(reg_lsb, data)) {
-    RCLCPP_WARN(node_->get_logger(),
-      "Failed to write offset at register 0x%02X (value: %d)", reg_lsb, value);
+
+  try {
+    if (config_.offset_acc.size() >= 3) {
+      write_byte(ACCEL_OFFSET_X_LSB_ADDR, config_.offset_acc[0] & 0xFF);
+      write_byte(ACCEL_OFFSET_X_MSB_ADDR, (config_.offset_acc[0] >> 8) & 0xFF);
+      write_byte(ACCEL_OFFSET_Y_LSB_ADDR, config_.offset_acc[1] & 0xFF);
+      write_byte(ACCEL_OFFSET_Y_MSB_ADDR, (config_.offset_acc[1] >> 8) & 0xFF);
+      write_byte(ACCEL_OFFSET_Z_LSB_ADDR, config_.offset_acc[2] & 0xFF);
+      write_byte(ACCEL_OFFSET_Z_MSB_ADDR, (config_.offset_acc[2] >> 8) & 0xFF);
+    }
+
+    write_byte(ACCEL_RADIUS_LSB_ADDR, config_.radius_acc & 0xFF);
+    write_byte(ACCEL_RADIUS_MSB_ADDR, (config_.radius_acc >> 8) & 0xFF);
+
+    if (config_.offset_mag.size() >= 3) {
+      write_byte(MAG_OFFSET_X_LSB_ADDR, config_.offset_mag[0] & 0xFF);
+      write_byte(MAG_OFFSET_X_MSB_ADDR, (config_.offset_mag[0] >> 8) & 0xFF);
+      write_byte(MAG_OFFSET_Y_LSB_ADDR, config_.offset_mag[1] & 0xFF);
+      write_byte(MAG_OFFSET_Y_MSB_ADDR, (config_.offset_mag[1] >> 8) & 0xFF);
+      write_byte(MAG_OFFSET_Z_LSB_ADDR, config_.offset_mag[2] & 0xFF);
+      write_byte(MAG_OFFSET_Z_MSB_ADDR, (config_.offset_mag[2] >> 8) & 0xFF);
+    }
+
+    write_byte(MAG_RADIUS_LSB_ADDR, config_.radius_mag & 0xFF);
+    write_byte(MAG_RADIUS_MSB_ADDR, (config_.radius_mag >> 8) & 0xFF);
+
+    if (config_.offset_gyr.size() >= 3) {
+      write_byte(GYRO_OFFSET_X_LSB_ADDR, config_.offset_gyr[0] & 0xFF);
+      write_byte(GYRO_OFFSET_X_MSB_ADDR, (config_.offset_gyr[0] >> 8) & 0xFF);
+      write_byte(GYRO_OFFSET_Y_LSB_ADDR, config_.offset_gyr[1] & 0xFF);
+      write_byte(GYRO_OFFSET_Y_MSB_ADDR, (config_.offset_gyr[1] >> 8) & 0xFF);
+      write_byte(GYRO_OFFSET_Z_LSB_ADDR, config_.offset_gyr[2] & 0xFF);
+      write_byte(GYRO_OFFSET_Z_MSB_ADDR, (config_.offset_gyr[2] >> 8) & 0xFF);
+    }
+
+    return true;
+  } catch (const std::exception &) {
+    return false;
   }
 }
 

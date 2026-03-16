@@ -316,13 +316,11 @@ CallbackReturn BNO055LifecycleNode::on_activate(const rclcpp_lifecycle::State & 
     RCLCPP_INFO(get_logger(), "Calibration timer started at %.1f Hz", calib_status_frequency_);
   }
 
-  // Create and start watchdog timer (runs every 1 second)
-  // Fast enough to detect disconnections quickly; the watchdog itself
-  // only does lightweight checks unless a timeout threshold is reached.
+  // Create and start watchdog timer (runs every 0.5 seconds, like Python)
   watchdog_timer_ = create_wall_timer(
-    std::chrono::milliseconds(1000),
+    std::chrono::milliseconds(500),
     std::bind(&BNO055LifecycleNode::watchdog_check_callback, this));
-  RCLCPP_INFO(get_logger(), "Watchdog timer started (1s interval)");
+  RCLCPP_INFO(get_logger(), "Watchdog timer started (0.5s interval)");
 
   RCLCPP_INFO(get_logger(), "Activation complete");
   return CallbackReturn::SUCCESS;
