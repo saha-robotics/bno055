@@ -83,41 +83,22 @@ bool SensorService::configure()
 {
   RCLCPP_INFO(node_->get_logger(), "Configuring device...");
 
-  // -- Adafruit pattern: set CONFIG mode first, THEN reset --
-  // BNO055 datasheet requires CONFIG mode to reliably accept SYS_TRIGGER
-  // reset. Writing reset while in a fusion mode (NDOF etc.) can be ignored.
-  RCLCPP_INFO(node_->get_logger(), "Switching to config mode before reset...");
-  {
-    std::vector<uint8_t> config_mode = {OPERATION_MODE_CONFIG};
-    // Best-effort: if this fails (e.g. sensor confused), the reset below
-    // will still attempt to bring it to a known state.
-    write_register(BNO055_OPR_MODE_ADDR, config_mode);
-    std::this_thread::sleep_for(std::chrono::milliseconds(25));
-  }
+  // ── Match Python SensorService.configure() exactly ──
+  // Python does NOT reset the sensor. It only:
+  //   1. Read chip ID to verify communication
+  //   2. Set CONFIG mode
+  //   3. Set power/page/trigger/units/axis
+  //   4. Set operation mode
+  // The SYS_TRIGGER 0x20 reset was killing the BNO055 and it would not
+  // recover without physical power cycle.
 
-  // Reset the sensor for a clean state
-  RCLCPP_INFO(node_->get_logger(), "Resetting sensor...");
-  std::vector<uint8_t> page_zero = {0x00};
-  write_register(BNO055_PAGE_ID_ADDR, page_zero);
-  std::vector<uint8_t> reset_trigger = {0x20};
-  write_register(BNO055_SYS_TRIGGER_ADDR, reset_trigger);
-
-  // -- Adafruit pattern: poll chip ID instead of fixed sleep --
-  // Adafruit does: delay(30); while(readChipId != 0xA0) { delay(10); } delay(50);
-  // The BNO055 can take 400-850ms to boot, but polling exits as soon as ready.
-  std::this_thread::sleep_for(std::chrono::milliseconds(30));
-  // Flush stale data from UART buffers after sensor reset
-  if (connector_) {
-    connector_->flush_buffers();
-  }
-
-  // Poll chip ID with 100ms intervals, up to 2 seconds total
+  // Step 1: Verify chip ID (first communication check)
   std::vector<uint8_t> chip_id;
   bool chip_id_ok = false;
-  for (int attempt = 0; attempt < 20; attempt++) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    if (connector_) {
-      connector_->flush_buffers();
+  for (int attempt = 0; attempt < 5; attempt++) {
+    if (attempt > 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      if (connector_) connector_->flush_buffers();
     }
     chip_id.clear();
     if (read_register(BNO055_CHIP_ID_ADDR, chip_id, 1) &&
@@ -126,20 +107,14 @@ bool SensorService::configure()
       chip_id_ok = true;
       break;
     }
-    if (attempt > 0 && attempt % 5 == 0) {
-      RCLCPP_WARN(node_->get_logger(),
-        "Waiting for BNO055 to boot after reset... (%d/20)", attempt);
-    }
   }
-  // Extra 50ms settling time after chip ID read (per Adafruit)
-  std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
   if (!chip_id_ok) {
-    RCLCPP_ERROR(node_->get_logger(), "Failed to read correct chip ID after reset");
+    RCLCPP_ERROR(node_->get_logger(), "Failed to read correct chip ID");
     return false;
   }
+  RCLCPP_INFO(node_->get_logger(), "Chip ID verified: 0xA0");
 
-  // Set to config mode (with retries - USB bus contention can cause transient failures)
+  // Step 2: Set CONFIG mode
   bool config_mode_ok = false;
   for (int attempt = 0; attempt < 5; attempt++) {
     if (attempt > 0) {
@@ -156,25 +131,24 @@ bool SensorService::configure()
     return false;
   }
 
-  // Set normal power mode
+  // Step 3: Set normal power mode
   std::vector<uint8_t> power_mode = {POWER_MODE_NORMAL};
   if (!write_register(BNO055_PWR_MODE_ADDR, power_mode)) {
     RCLCPP_WARN(node_->get_logger(), "Unable to set IMU normal power mode");
   }
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
-  // Set register page 0
+  // Step 4: Set register page 0
   std::vector<uint8_t> page = {0x00};
   if (!write_register(BNO055_PAGE_ID_ADDR, page)) {
     RCLCPP_WARN(node_->get_logger(), "Unable to set IMU register page 0");
   }
 
-  // System trigger - clear reset
+  // Step 5: SYS_TRIGGER = 0x00 (start, NO reset)
   std::vector<uint8_t> trigger = {0x00};
   if (!write_register(BNO055_SYS_TRIGGER_ADDR, trigger)) {
     RCLCPP_WARN(node_->get_logger(), "Unable to start IMU");
   }
-  // Adafruit: delay(10) after clearing SYS_TRIGGER
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
   // Verify self-test result

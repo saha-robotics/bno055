@@ -22,9 +22,22 @@ find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(example_interfaces REQUIRED)
 
+# ── wjwwood/serial library (built inline as a static library) ──
+set(SERIAL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/ext/serial)
+add_library(serial_lib STATIC
+  ${SERIAL_DIR}/src/serial.cc
+  ${SERIAL_DIR}/src/impl/unix.cc
+  ${SERIAL_DIR}/src/impl/list_ports/list_ports_linux.cc
+)
+target_include_directories(serial_lib PUBLIC
+  ${SERIAL_DIR}/include
+)
+target_link_libraries(serial_lib rt pthread)
+
 # Include directories
 include_directories(
   include
+  ${SERIAL_DIR}/include
 )
 
 # C++ Lifecycle Node executable
@@ -45,6 +58,7 @@ ament_target_dependencies(bno055_lifecycle_node
   std_msgs
   example_interfaces
 )
+target_link_libraries(bno055_lifecycle_node serial_lib)
 
 # Install C++ executables
 install(TARGETS
