@@ -1,7 +1,8 @@
 name: Version Bump
 
-# When a devel -> main PR is merged, automatically bump the version in
-# package.xml based on the PR label (major/minor/patch).
+# This repo has no dedicated devel branch, so any merged PR into main
+# triggers a version bump in package.xml based on the PR label
+# (major/minor/patch).
 on:
   pull_request:
     types: [closed]
@@ -12,10 +13,8 @@ permissions:
 
 jobs:
   bump:
-    # Run only on PRs that were actually merged AND opened from devel.
-    if: >-
-      github.event.pull_request.merged == true &&
-      github.event.pull_request.head.ref == 'devel'
+    # Run on any PR that was actually merged into main.
+    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     steps:
       - name: Checkout main
