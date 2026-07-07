@@ -1,0 +1,78 @@
+name: Version Bump
+
+# When a devel -> main PR is merged, automatically bump the version in
+# package.xml based on the PR label (major/minor/patch).
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    # Run only on PRs that were actually merged AND opened from devel.
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.ref == 'devel'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          # Org-level PAT that is in the ruleset bypass list, so the push
+          # below is allowed on the protected branch.
+          token: ${{ secrets.GH_RELEASE_TOKEN }}
+
+      - name: Determine bump type from PR labels
+        id: bump
+        env:
+          LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
+        run: |
+          if echo "$LABELS" | grep -qw "major"; then
+            echo "type=major" >> "$GITHUB_OUTPUT"
+          elif echo "$LABELS" | grep -qw "minor"; then
+            echo "type=minor" >> "$GITHUB_OUTPUT"
+          else
+            # Default to patch when the label is "patch" or no label is set.
+            echo "type=patch" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute new version
+        id: version
+        run: |
+          set -euo pipefail
+          CURRENT=$(grep -oPm1 '(?<=<version>)[^<]+' package.xml)
+          echo "Current version: $CURRENT"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          case "${{ steps.bump.outputs.type }}" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+          NEW="${MAJOR}.${MINOR}.${PATCH}"
+          echo "New version: $NEW (${{ steps.bump.outputs.type }})"
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
+
+      - name: Apply version to package.xml
+        run: |
+          set -euo pipefail
+          NEW="${{ steps.version.outputs.new }}"
+          sed -i "s|<version>[^<]*</version>|<version>${NEW}</version>|" package.xml
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "No changes, exiting."
+            exit 0
+          fi
+          git add package.xml
+          git commit -m "chore(release): bump version ${{ steps.version.outputs.current }} -> ${{ steps.version.outputs.new }} [skip ci]"
+          git push origin main
